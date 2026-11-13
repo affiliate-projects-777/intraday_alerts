@@ -86,7 +86,7 @@ def save_state(state):
 def append_snapshot(state, key, ts, value, keep_hours=KEEP_HOURS):
     hist = state.get(key, [])
     hist.append([ts.isoformat(), float(value)])
-    cutoff = ts - pd.Timedelta(hours=keep_hours)
+    cutoff = ts - pd.Timedelta(hours=float(keep_hours))
     hist = [[t, v] for t, v in hist if pd.Timestamp(t) >= cutoff]
     state[key] = hist
     return [(pd.Timestamp(t), v) for t, v in hist]
@@ -107,7 +107,7 @@ def had_no_increase_in(history, as_of, hours):
     if not same_day:
         return False, None, None, False
     latest_t, latest_v = same_day[-1]
-    cutoff = as_of - pd.Timedelta(hours=hours)
+    cutoff = as_of - pd.Timedelta(hours=float(hours))
     candidates = [(t, v) for t, v in same_day if t <= cutoff]
     if not candidates:
         return False, None, latest_v, False
@@ -279,7 +279,7 @@ def run_once():
                 c_hist = append_snapshot(state, c_key, now, float(today_c.get(lid, 0.0)))
                 r_hist = append_snapshot(state, r_key, now, float(today_r.get(lid, 0.0)))
                 today_lw = now.date()
-                cutoff_warn = now - pd.Timedelta(hours=REG_17_WARN_H)
+                cutoff_warn = now - pd.Timedelta(hours=float(REG_17_WARN_H))
                 c_same_day = sorted((t2, v) for t2, v in c_hist if t2.date() == today_lw and t2 <= now)
                 r_same_day = sorted((t2, v) for t2, v in r_hist if t2.date() == today_lw and t2 <= now)
                 c_before = [(t2, v) for t2, v in c_same_day if t2 <= cutoff_warn]
@@ -288,7 +288,7 @@ def run_once():
                     c_delta = c_same_day[-1][1] - max(c_before, key=lambda tv: tv[0])[1]
                     r_delta = r_same_day[-1][1] - max(r_before, key=lambda tv: tv[0])[1]
                     if c_delta >= REG_17_MIN_CLICKS_IN_WINDOW and r_delta == 0:
-                        cutoff_crit = now - pd.Timedelta(hours=REG_17_CRIT_H)
+                        cutoff_crit = now - pd.Timedelta(hours=float(REG_17_CRIT_H))
                         r_before_crit = [(t2, v) for t2, v in r_same_day if t2 <= cutoff_crit]
                         still_zero_6h = bool(r_before_crit) and r_same_day[-1][1] == max(r_before_crit, key=lambda tv: tv[0])[1]
                         alerts.append({

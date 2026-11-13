@@ -1,0 +1,20 @@
+version: "3.9"
+
+services:
+  intraday_alerts:
+    build: .
+    container_name: intraday_alerts
+    restart: always
+    environment:
+      - REPLICA_HOST=${REPLICA_HOST}
+      - REPLICA_PORT=${REPLICA_PORT}
+      - REPLICA_DATABASE=${REPLICA_DATABASE}
+      - REPLICA_USER=${REPLICA_USER}
+      - REPLICA_PASSWORD=${REPLICA_PASSWORD}
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+
+networks:
+  default:
+    driver: bridge

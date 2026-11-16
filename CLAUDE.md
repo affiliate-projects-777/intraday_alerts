@@ -15,12 +15,20 @@ SSH-tunneled `db.py`, because this VPS has direct network access to the replica
 (confirmed via `affiliate-projects-777/gsheet_reports/helpers/db.py`'s own `REPLICA_*`
 connection, which connects the same way with no tunnel).
 
+## Telegram (added 2026-11-16)
+
+Every hourly run that returns any alerts sends ONE message to the same Telegram bot/chat
+as `affiliate-projects-777/daily_health_check` (user's own choice: one chat for both
+cadences). An issue that stays open resends every qualifying hour it's still open -
+deliberately no NEW/ESCALATION/REMINDER dedup like the daily check has, again the user's
+own choice, traded for simplicity over quieter delivery. A run with zero alerts sends
+nothing. `send_telegram()`/`format_hourly_message()` at the bottom of `main.py` - same
+send contract (`True` only on a real Telegram 200) as `daily_health_check.py`'s own
+`send_telegram()`, but no idempotency guard: there is no "already sent this hour" concept
+to guard against here, since resending every qualifying hour is the intended behavior.
+
 ## What this does NOT do
 
-- **Does not send anything.** No Telegram, no webhook, no alert delivery of any kind -
-  collection only. Each hourly run appends its results to
-  `data/intraday_results.jsonl` for a human (or the traffic repo's simulator) to read
-  later.
 - **Does not cover bets/wins.** Confirmed in the traffic repo's own investigation
   (2026-11-13): `project_N_sessions` (the only source for bets/wins) is a once-daily
   batch job with zero rows for "today" until it lands - there is nothing to snapshot
@@ -46,9 +54,10 @@ connection, which connects the same way with no tunnel).
   collected raw value plus any alerts that run fired. This is the file meant to be
   read back (by a human, or later by the traffic repo's simulator) - kept indefinitely,
   never pruned by this script.
-- `.env` (gitignored, not committed) needs: `REPLICA_HOST`, `REPLICA_PORT`,
+- Env vars (Portainer stack, not committed): `REPLICA_HOST`, `REPLICA_PORT`,
   `REPLICA_DATABASE`, `REPLICA_USER`, `REPLICA_PASSWORD` - same values as
-  `gsheet_reports`' own `.env` on this VPS (same replica).
+  `gsheet_reports`' own `.env` on this VPS (same replica); `TELEGRAM_BOT_TOKEN`,
+  `TELEGRAM_CHAT_ID` - same bot/chat as `daily_health_check`'s stack.
 
 ## Known gap, caught while setting this up (2026-11-13)
 

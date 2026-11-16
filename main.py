@@ -11,9 +11,15 @@ Every run (hourly via cron/scheduler.cron, plus once immediately on container st
 entrypoint.sh) appends ONE line to /app/data/intraday_results.jsonl - every run's raw
 collected values and any alerts fired that hour, kept indefinitely so a day's worth (or
 more) of real hourly data accumulates for review, not just the rolling comparison state
-in intraday_state.json. Nothing is sent anywhere (no Telegram, no webhook) - this is
-collection only, exactly as asked: "I will give you the output and you will add the
-hourly alerts" tomorrow.
+in intraday_state.json.
+
+Telegram sending added 2026-11-16 (user: "now i want through portainer to get the daily
+and hourly alerts on the telegram bot"), same bot/chat as the daily check
+(affiliate-projects-777/daily_health_check), per the user's own choice. Cadence is
+deliberately simple, also the user's own choice: every hourly run that returns any
+alerts sends one message, grouped by project - an issue that stays open resends every
+qualifying hour for as long as it's open, with NO new-vs-still-open distinction (unlike
+the daily check's NEW/ESCALATION/REMINDER eventing). A run with zero alerts sends nothing.
 """
 import os
 import sys
@@ -363,11 +369,56 @@ def run_once():
     return alerts
 
 
+def send_telegram(text):
+    """Same contract as Documents/traffic/health_check/daily_health_check.py's own
+    send_telegram(): True only on an actual 200 from Telegram, logs and returns False
+    otherwise (not configured, HTTP error, or an exception) - never raises, never retries."""
+    token = os.environ.get('TELEGRAM_BOT_TOKEN')
+    chat_id = os.environ.get('TELEGRAM_CHAT_ID')
+    if not token or not chat_id:
+        logging.info("Telegram not configured (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID missing) - skipping send")
+        return False
+    try:
+        import requests
+        resp = requests.post(f'https://api.telegram.org/bot{token}/sendMessage',
+                              data={'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}, timeout=15)
+        if resp.status_code == 200:
+            logging.info("Telegram message sent")
+            return True
+        logging.error(f"Telegram send failed: {resp.status_code} {resp.text}")
+        return False
+    except Exception as e:
+        logging.error(f"Telegram send failed (non-fatal): {e}")
+        return False
+
+
+def format_hourly_message(alerts, now):
+    """One message per hourly run, grouped by project - resent every hour an issue stays open
+    (user's own choice, 2026-11-16: no new-vs-still-open distinction here, unlike the daily
+    check's NEW/ESCALATION/REMINDER - every qualifying hour gets its own send)."""
+    import html as _html
+    by_project = {}
+    for a in alerts:
+        by_project.setdefault(a['project_id'], []).append(a)
+    lines = [f"<b>Hourly check — {now.strftime('%Y-%m-%d %H:%M')}</b>"]
+    for pid in sorted(by_project, key=lambda p: PROJECTS.get(p, str(p))):
+        label = PROJECTS.get(pid, str(pid))
+        lines.append(f"\n<b>{_html.escape(label)}</b>")
+        for a in sorted(by_project[pid], key=lambda x: (x['severity'] != 'CRITICAL', x['rule_id'])):
+            entity = a['entity']
+            entity_part = f" ({_html.escape(entity)})" if entity != label else ""
+            lines.append(f"[{a['severity']}] {a['rule_id']} - {_html.escape(a['metric'])}{entity_part}\n"
+                          f"    {_html.escape(a['note'])}")
+    return "\n".join(lines)
+
+
 if __name__ == '__main__':
     try:
         found = run_once()
         for a in found:
             logging.warning(f"ALERT {a['rule_id']} {a['level']} {a['entity']}: {a['note']}")
+        if found:
+            send_telegram(format_hourly_message(found, datetime.now()))
     except Exception as e:
         logging.error(f"Run failed: {e}")
         raise

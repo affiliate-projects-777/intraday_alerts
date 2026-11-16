@@ -29,7 +29,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 STATE_PATH = os.path.join(DATA_DIR, 'intraday_state.json')
 RESULTS_PATH = os.path.join(DATA_DIR, 'intraday_results.jsonl')
-KEEP_HOURS = 10  # >= the longest window below (6h) plus margin for a missed/delayed run
+KEEP_HOURS = 14  # >= the longest window below (the 12h dynamic-window cap) plus margin for a
+                 # missed/delayed run - raised from 10 when DYNAMIC_WINDOW_CAP_H (12h) was added
+                 # below; at 10 a capped 12h check could never see old-enough history to fire.
 
 # Same project set/labels as Documents/traffic/health_check/daily_health_check.py's
 # PROJECTS - duplicated here since this is a separate deployed repo, not an import.
@@ -81,6 +83,28 @@ DAT_01_FEED_FLOORS = {'clicks': CLK_01_ELIGIBLE_CLICKS_YDAY, 'registrations': 5,
 # replacement for it.
 REG_01_ELIGIBLE_REGS_YDAY = 5
 FTD_01_ELIGIBLE_FTDS_YDAY = 2
+
+# Dynamic patience window added 2026-11-16 (same change, same evidence, as
+# Documents/traffic/health_check/intraday_check.py's own identical addition - this repo
+# duplicates that file's detection logic rather than importing it, see this file's own header).
+# The floors above answer "is this entity worth watching at all"; this answers "how long is a
+# flat reading actually normal for THIS entity's own pace" - a project with 2 FTDs/day has an
+# ordinary ~12h gap between FTDs, so a flat 3h window is noise any time of day, not just
+# overnight. Confirmed on the real 72-run collection in data/intraday_results.jsonl: re-filtering
+# the same window with this on top of the floors took 106 open episodes down to 23.
+DYNAMIC_WINDOW_SAFETY = 1.5
+DYNAMIC_WINDOW_CAP_H = 12
+
+
+def dynamic_window(base_hours, yesterday_count):
+    """Scales a fixed check window up when yesterday's volume for this metric/entity was low
+    enough that a flat reading for `base_hours` is just this entity's normal pace, not a stall.
+    Never goes below `base_hours`; capped at DYNAMIC_WINDOW_CAP_H so a genuinely dead feed still
+    alerts well within a day."""
+    if yesterday_count <= 0:
+        return max(base_hours, DYNAMIC_WINDOW_CAP_H)
+    scaled = 24.0 / yesterday_count * DYNAMIC_WINDOW_SAFETY
+    return max(base_hours, min(scaled, DYNAMIC_WINDOW_CAP_H))
 
 
 def get_engine():
@@ -236,12 +260,14 @@ def run_once():
         t = totals[pid]
 
         if t['clicks']['yesterday'] >= CLK_01_ELIGIBLE_CLICKS_YDAY:
+            clk_window = dynamic_window(CLK_01_WINDOW_H, t['clicks']['yesterday'])
             a = check_project_metric(state, now, pid, label, 'clicks', t['clicks']['today'],
-                                      CLK_01_WINDOW_H, 'CLK-01', 'Clicks')
+                                      clk_window, 'CLK-01', 'Clicks')
             if a: alerts.append(a)
 
         if t['registrations']['yesterday'] >= REG_01_ELIGIBLE_REGS_YDAY:
             reg_window = REG_01_WINDOW_HIGH_H if t['registrations']['yesterday'] < REG_01_LOW_FLOOR_YDAY else REG_01_WINDOW_LOW_H
+            reg_window = dynamic_window(reg_window, t['registrations']['yesterday'])
             a = check_project_metric(state, now, pid, label, 'registrations', t['registrations']['today'],
                                       reg_window, 'REG-01', 'Registrations',
                                       f" (window={reg_window}h, yesterday's regs={t['registrations']['yesterday']:.0f})")
@@ -249,28 +275,31 @@ def run_once():
 
         if t['ftds']['yesterday'] >= FTD_01_ELIGIBLE_FTDS_YDAY:
             ftd_window = FTD_01_WINDOW_HIGH_H if t['ftds']['yesterday'] < FTD_01_LOW_FLOOR_YDAY else FTD_01_WINDOW_LOW_H
+            ftd_window = dynamic_window(ftd_window, t['ftds']['yesterday'])
             a = check_project_metric(state, now, pid, label, 'ftds', t['ftds']['today'],
                                       ftd_window, 'FTD-01', 'FTDs',
                                       f" (window={ftd_window}h, yesterday's FTDs={t['ftds']['yesterday']:.0f})")
             if a: alerts.append(a)
 
         if t['deposits']['yesterday'] >= DEP_01_ELIGIBLE_DEPOSITS_YDAY:
+            dep_window = dynamic_window(DEP_01_WINDOW_H, t['deposits']['yesterday'])
             a = check_project_metric(state, now, pid, label, 'deposits', t['deposits']['today'],
-                                      DEP_01_WINDOW_H, 'DEP-01', 'Deposit events')
+                                      dep_window, 'DEP-01', 'Deposit events')
             if a: alerts.append(a)
 
         for feed in DAT_01_FEEDS:
             if t[feed]['yesterday'] < DAT_01_FEED_FLOORS[feed]:
                 continue  # below this feed's own volume floor - "flat" is normal, not a signal
+            feed_window = dynamic_window(DAT_01_WINDOW_H, t[feed]['yesterday'])
             key = f'{pid}|{feed}|Project'
             hist = append_snapshot(state, key, now, t[feed]['today'])
-            triggered, old_v, latest_v, had_history = had_no_increase_in(hist, now, DAT_01_WINDOW_H)
+            triggered, old_v, latest_v, had_history = had_no_increase_in(hist, now, feed_window)
             if triggered:
                 alerts.append({
                     'rule_id': 'DAT-01', 'metric': f'Data freshness ({feed})', 'level': 'Project',
                     'entity': label, 'project_id': pid, 'value': latest_v, 'baseline': old_v,
                     'severity': 'CRITICAL',
-                    'note': f'{feed} feed stale: no increase in >= {DAT_01_WINDOW_H}h (was {old_v}, still {latest_v})',
+                    'note': f'{feed} feed stale: no increase in >= {feed_window:.1f}h (was {old_v}, still {latest_v})',
                 })
 
         try:

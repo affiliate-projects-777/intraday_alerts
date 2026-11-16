@@ -64,17 +64,23 @@ DEP_01_WINDOW_H = 2
 DAT_01_WINDOW_H = 3
 DAT_01_FEEDS = ('clicks', 'registrations', 'ftds', 'deposits')
 
-# Eligibility floors added 2026-11-16 (same finding as above): CLK-01/DEP-01/DAT-01 had NO
-# volume floor at all, unlike REG-01/FTD-01's own adaptive window - confirmed live on the
-# real deployed data: Brazino777.py/.bet.br/.in (this project's own lowest-volume projects)
-# fired CLK-01/DEP-01/DAT-01 on nearly every single hourly run, because "flat for 2-3h" is
-# just normal for a project that gets a trickle of traffic, not an incident. Below the floor,
-# the check is skipped entirely for that project/feed that hour (not silently always-firing),
-# same "flag feasibility, don't fake it" principle as every NOT SIMULATED rule in this system.
+# Eligibility floors added 2026-11-16 (finding: 85% of hourly runs fired an alert, almost
+# all of it noise) - confirmed live on the real deployed data: Brazino777.py/.bet.br/.in
+# (this project's own lowest-volume projects) fired CLK-01/DEP-01/DAT-01 on nearly every
+# single hourly run, because CLK-01/DEP-01/DAT-01 had NO volume floor at all - "flat for
+# 2-3h" is just normal for a project that gets a trickle of traffic, not an incident.
 CLK_01_ELIGIBLE_CLICKS_YDAY = 100
 DEP_01_ELIGIBLE_DEPOSITS_YDAY = 10
-DAT_01_FEED_FLOORS = {'clicks': CLK_01_ELIGIBLE_CLICKS_YDAY, 'registrations': REG_01_LOW_FLOOR_YDAY,
-                       'ftds': FTD_01_LOW_FLOOR_YDAY, 'deposits': DEP_01_ELIGIBLE_DEPOSITS_YDAY}
+DAT_01_FEED_FLOORS = {'clicks': CLK_01_ELIGIBLE_CLICKS_YDAY, 'registrations': 5,
+                       'ftds': 2, 'deposits': DEP_01_ELIGIBLE_DEPOSITS_YDAY}
+# REG-01/FTD-01 already widen their window on a low-volume day (2h->4h, 3h->6h) - but a
+# WIDER window doesn't help when yesterday's volume is literally 0 (confirmed live: several
+# of the same noisy alerts above read "yesterday's regs=0"/"yesterday's FTDs=0" in their own
+# note) - no window width makes "flat" meaningful against a baseline of zero. These are a
+# second, separate eligibility floor on top of the existing window-width adaptation, not a
+# replacement for it.
+REG_01_ELIGIBLE_REGS_YDAY = 5
+FTD_01_ELIGIBLE_FTDS_YDAY = 2
 
 
 def get_engine():
@@ -234,17 +240,19 @@ def run_once():
                                       CLK_01_WINDOW_H, 'CLK-01', 'Clicks')
             if a: alerts.append(a)
 
-        reg_window = REG_01_WINDOW_HIGH_H if t['registrations']['yesterday'] < REG_01_LOW_FLOOR_YDAY else REG_01_WINDOW_LOW_H
-        a = check_project_metric(state, now, pid, label, 'registrations', t['registrations']['today'],
-                                  reg_window, 'REG-01', 'Registrations',
-                                  f" (window={reg_window}h, yesterday's regs={t['registrations']['yesterday']:.0f})")
-        if a: alerts.append(a)
+        if t['registrations']['yesterday'] >= REG_01_ELIGIBLE_REGS_YDAY:
+            reg_window = REG_01_WINDOW_HIGH_H if t['registrations']['yesterday'] < REG_01_LOW_FLOOR_YDAY else REG_01_WINDOW_LOW_H
+            a = check_project_metric(state, now, pid, label, 'registrations', t['registrations']['today'],
+                                      reg_window, 'REG-01', 'Registrations',
+                                      f" (window={reg_window}h, yesterday's regs={t['registrations']['yesterday']:.0f})")
+            if a: alerts.append(a)
 
-        ftd_window = FTD_01_WINDOW_HIGH_H if t['ftds']['yesterday'] < FTD_01_LOW_FLOOR_YDAY else FTD_01_WINDOW_LOW_H
-        a = check_project_metric(state, now, pid, label, 'ftds', t['ftds']['today'],
-                                  ftd_window, 'FTD-01', 'FTDs',
-                                  f" (window={ftd_window}h, yesterday's FTDs={t['ftds']['yesterday']:.0f})")
-        if a: alerts.append(a)
+        if t['ftds']['yesterday'] >= FTD_01_ELIGIBLE_FTDS_YDAY:
+            ftd_window = FTD_01_WINDOW_HIGH_H if t['ftds']['yesterday'] < FTD_01_LOW_FLOOR_YDAY else FTD_01_WINDOW_LOW_H
+            a = check_project_metric(state, now, pid, label, 'ftds', t['ftds']['today'],
+                                      ftd_window, 'FTD-01', 'FTDs',
+                                      f" (window={ftd_window}h, yesterday's FTDs={t['ftds']['yesterday']:.0f})")
+            if a: alerts.append(a)
 
         if t['deposits']['yesterday'] >= DEP_01_ELIGIBLE_DEPOSITS_YDAY:
             a = check_project_metric(state, now, pid, label, 'deposits', t['deposits']['today'],

@@ -53,11 +53,28 @@ CLK_01_WINDOW_H = 2
 CLK_17_WARN_H, CLK_17_CRIT_H, CLK_17_ELIGIBLE_CLICKS_YDAY = 2, 6, 100
 REG_01_WINDOW_LOW_H, REG_01_WINDOW_HIGH_H, REG_01_LOW_FLOOR_YDAY = 2, 4, 100
 REG_17_WARN_H, REG_17_CRIT_H, REG_17_MIN_CLICKS_IN_WINDOW = 3, 6, 30
-REG_17_ELIGIBLE_CLICKS_YDAY, REG_17_ELIGIBLE_REGS_YDAY = 100, 10
+# REG_17_ELIGIBLE_REGS_YDAY raised 2026-11-16 (finding: 85% of hourly runs fired an alert,
+# most of it noise) - confirmed real: with a 10/day floor, a LP can legitimately have a
+# 3-hour gap with zero registrations just from normal spacing, not a broken handoff. 30/day
+# (roughly one every 2-3h on average) makes a genuine 3h gap a real deviation, not noise -
+# not independently re-validated against a longer real-history backtest.
+REG_17_ELIGIBLE_CLICKS_YDAY, REG_17_ELIGIBLE_REGS_YDAY = 100, 30
 FTD_01_WINDOW_LOW_H, FTD_01_WINDOW_HIGH_H, FTD_01_LOW_FLOOR_YDAY = 3, 6, 50
 DEP_01_WINDOW_H = 2
 DAT_01_WINDOW_H = 3
 DAT_01_FEEDS = ('clicks', 'registrations', 'ftds', 'deposits')
+
+# Eligibility floors added 2026-11-16 (same finding as above): CLK-01/DEP-01/DAT-01 had NO
+# volume floor at all, unlike REG-01/FTD-01's own adaptive window - confirmed live on the
+# real deployed data: Brazino777.py/.bet.br/.in (this project's own lowest-volume projects)
+# fired CLK-01/DEP-01/DAT-01 on nearly every single hourly run, because "flat for 2-3h" is
+# just normal for a project that gets a trickle of traffic, not an incident. Below the floor,
+# the check is skipped entirely for that project/feed that hour (not silently always-firing),
+# same "flag feasibility, don't fake it" principle as every NOT SIMULATED rule in this system.
+CLK_01_ELIGIBLE_CLICKS_YDAY = 100
+DEP_01_ELIGIBLE_DEPOSITS_YDAY = 10
+DAT_01_FEED_FLOORS = {'clicks': CLK_01_ELIGIBLE_CLICKS_YDAY, 'registrations': REG_01_LOW_FLOOR_YDAY,
+                       'ftds': FTD_01_LOW_FLOOR_YDAY, 'deposits': DEP_01_ELIGIBLE_DEPOSITS_YDAY}
 
 
 def get_engine():
@@ -212,9 +229,10 @@ def run_once():
     for pid, label in PROJECTS.items():
         t = totals[pid]
 
-        a = check_project_metric(state, now, pid, label, 'clicks', t['clicks']['today'],
-                                  CLK_01_WINDOW_H, 'CLK-01', 'Clicks')
-        if a: alerts.append(a)
+        if t['clicks']['yesterday'] >= CLK_01_ELIGIBLE_CLICKS_YDAY:
+            a = check_project_metric(state, now, pid, label, 'clicks', t['clicks']['today'],
+                                      CLK_01_WINDOW_H, 'CLK-01', 'Clicks')
+            if a: alerts.append(a)
 
         reg_window = REG_01_WINDOW_HIGH_H if t['registrations']['yesterday'] < REG_01_LOW_FLOOR_YDAY else REG_01_WINDOW_LOW_H
         a = check_project_metric(state, now, pid, label, 'registrations', t['registrations']['today'],
@@ -228,11 +246,14 @@ def run_once():
                                   f" (window={ftd_window}h, yesterday's FTDs={t['ftds']['yesterday']:.0f})")
         if a: alerts.append(a)
 
-        a = check_project_metric(state, now, pid, label, 'deposits', t['deposits']['today'],
-                                  DEP_01_WINDOW_H, 'DEP-01', 'Deposit events')
-        if a: alerts.append(a)
+        if t['deposits']['yesterday'] >= DEP_01_ELIGIBLE_DEPOSITS_YDAY:
+            a = check_project_metric(state, now, pid, label, 'deposits', t['deposits']['today'],
+                                      DEP_01_WINDOW_H, 'DEP-01', 'Deposit events')
+            if a: alerts.append(a)
 
         for feed in DAT_01_FEEDS:
+            if t[feed]['yesterday'] < DAT_01_FEED_FLOORS[feed]:
+                continue  # below this feed's own volume floor - "flat" is normal, not a signal
             key = f'{pid}|{feed}|Project'
             hist = append_snapshot(state, key, now, t[feed]['today'])
             triggered, old_v, latest_v, had_history = had_no_increase_in(hist, now, DAT_01_WINDOW_H)

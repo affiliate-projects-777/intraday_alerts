@@ -11,6 +11,8 @@ services:
       - REPLICA_DATABASE=${REPLICA_DATABASE}
       - REPLICA_USER=${REPLICA_USER}
       - REPLICA_PASSWORD=${REPLICA_PASSWORD}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
     volumes:
       - ./logs:/app/logs
       - ./data:/app/data

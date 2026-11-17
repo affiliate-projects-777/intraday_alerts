@@ -20,6 +20,13 @@ deliberately simple, also the user's own choice: every hourly run that returns a
 alerts sends one message, grouped by project - an issue that stays open resends every
 qualifying hour for as long as it's open, with NO new-vs-still-open distinction (unlike
 the daily check's NEW/ESCALATION/REMINDER eventing). A run with zero alerts sends nothing.
+
+Per-project timezone for the "hasn't started yet" grace period (added 2026-11-17, user: "take
+into consideration each project's timezone... during the night we do not expect much traffic"):
+GRACE_UNTIL_HOUR now means 5am in EACH project's own local time, not this container's Athens
+server time (TZ=Europe/Athens) - the "same calendar day"/window-width logic is untouched and
+still runs on server time throughout; only the grace gate's hour comparison is localized per
+project. See PROJECT_TIMEZONES/local_hour_for().
 """
 import os
 import sys
@@ -114,6 +121,43 @@ DAT_01_FEED_FLOORS['ftds'] = FTD_01_ELIGIBLE_FTDS_YDAY
 # dynamic window keeps applying at any hour.
 GRACE_UNTIL_HOUR = 5
 
+# Per-project local timezone, for the grace period above ONLY - GRACE_UNTIL_HOUR means 5am in
+# EACH project's own local time, not this container's Athens server time. Added 2026-11-17
+# (user: "take into consideration each project's timezone... since during the night we do not
+# expect much traffic") after realizing the grace check above used as_of.hour unconverted -
+# this container runs on TZ=Europe/Athens (see this repo's own Dockerfile), so a flat "hour < 5"
+# test was gating Brazil's/India's/etc's own night by Athens' clock, not theirs (e.g. Athens
+# 05:00 in Nov/winter = Brazil ~00:00, well before Brazil's own early-morning quiet hours even
+# start - the grace was covering the wrong hours for every non-Athens project). Country per
+# project_id from this brand's own domain suffix - PROJECTS' comment above already treats
+# .ar/.in/.py as single-country-by-project_id for the same reason; project_id=7 (.in) is assumed
+# India (Asia/Kolkata) by that same ccTLD convention - not independently verified against a
+# billing/country field, flag if wrong. project_id=4 (Brazino777.io) is deliberately NOT in this
+# map: it spans 6 different countries internally (AR/BO/CL/CO/EC/VE - see the daily-check repo's
+# P4_COUNTRIES) with no single correct local time, and this check has no per-country split
+# (only project/LP level) to pick one correctly - it falls back to this container's own Athens
+# hour unconverted, i.e. the exact pre-2026-11-17 behavior, until per-country segmentation is
+# added here too.
+PROJECT_TIMEZONES = {
+    1: 'America/Sao_Paulo',               # Brazino777.bet.br - Brazil
+    3: 'America/Mexico_City',             # Brazino777.mx - Mexico
+    6: 'America/Argentina/Buenos_Aires',  # Brazino777.ar - Argentina
+    7: 'Asia/Kolkata',                    # Brazino777.in - India (assumed, see above)
+    10: 'America/Asuncion',               # Brazino777.py - Paraguay
+}
+
+
+def local_hour_for(now, tz_name):
+    """Converts `now` (this container's naive wall-clock time, i.e. Athens - TZ=Europe/Athens)
+    to `tz_name`'s own local hour, for the grace period's "is it night there" check. Returns
+    Athens' own hour unconverted when tz_name is None (project 4 - see PROJECT_TIMEZONES'
+    comment)."""
+    if tz_name is None:
+        return now.hour
+    aware = now.tz_localize('Europe/Athens') if now.tzinfo is None else now.tz_convert('Europe/Athens')
+    return aware.tz_convert(tz_name).hour
+
+
 # Dynamic patience window added 2026-11-16 (same change, same evidence, as
 # Documents/traffic/health_check/intraday_check.py's own identical addition - this repo
 # duplicates that file's detection logic rather than importing it, see this file's own header).
@@ -178,7 +222,7 @@ def append_result(record):
 # ------------------------------------------------------------- pure check logic
 # (identical to intraday_check.py's own had_no_increase_in() - see that file for the
 # full reasoning on the same-calendar-day guard)
-def had_no_increase_in(history, as_of, hours, grace_until_hour=GRACE_UNTIL_HOUR):
+def had_no_increase_in(history, as_of, hours, grace_until_hour=GRACE_UNTIL_HOUR, local_hour=None):
     today = as_of.date()
     same_day = sorted((t, v) for t, v in history if t.date() == today and t <= as_of)
     if not same_day:
@@ -189,11 +233,15 @@ def had_no_increase_in(history, as_of, hours, grace_until_hour=GRACE_UNTIL_HOUR)
     if not candidates:
         return False, None, latest_v, False
     old_t, old_v = max(candidates, key=lambda tv: tv[0])
-    if old_v == 0 and grace_until_hour is not None and as_of.hour < grace_until_hour:
+    check_hour = as_of.hour if local_hour is None else local_hour
+    if old_v == 0 and grace_until_hour is not None and check_hour < grace_until_hour:
         # Nothing has happened yet today as of the comparison point - "hasn't started" and
         # "dead" look identical until enough of the day has passed, so don't fire yet. Once
         # old_v > 0 (something ticked, then went flat) this grace no longer applies, at any
         # hour - see GRACE_UNTIL_HOUR's own comment for the real evidence behind this.
+        # check_hour (added 2026-11-17): the project's own local hour, not necessarily
+        # as_of.hour (this container's Athens server time) - see PROJECT_TIMEZONES/
+        # local_hour_for() above.
         return False, old_v, latest_v, True
     return (latest_v <= old_v), old_v, latest_v, True
 
@@ -267,10 +315,10 @@ def fetch_lp_totals(engine, pid, today, yesterday):
 
 
 # ------------------------------------------------------------- rule evaluators
-def check_project_metric(state, now, pid, label, metric, value_today, window_hours, rule_id, metric_label, note_extra=''):
+def check_project_metric(state, now, pid, label, metric, value_today, window_hours, rule_id, metric_label, note_extra='', local_hour=None):
     key = f'{pid}|{metric}|Project'
     hist = append_snapshot(state, key, now, value_today)
-    triggered, old_v, latest_v, had_history = had_no_increase_in(hist, now, window_hours)
+    triggered, old_v, latest_v, had_history = had_no_increase_in(hist, now, window_hours, local_hour=local_hour)
     if not triggered:
         return None
     return {
@@ -294,11 +342,15 @@ def run_once():
 
     for pid, label in PROJECTS.items():
         t = totals[pid]
+        # This project's own local hour, for the grace period only (added 2026-11-17) - see
+        # PROJECT_TIMEZONES/local_hour_for() above. Computed once per project per run, reused
+        # by every rule below so all of this project's checks agree on "is it night there".
+        local_hour = local_hour_for(now, PROJECT_TIMEZONES.get(pid))
 
         if t['clicks']['yesterday'] >= CLK_01_ELIGIBLE_CLICKS_YDAY:
             clk_window = dynamic_window(CLK_01_WINDOW_H, t['clicks']['yesterday'])
             a = check_project_metric(state, now, pid, label, 'clicks', t['clicks']['today'],
-                                      clk_window, 'CLK-01', 'Clicks')
+                                      clk_window, 'CLK-01', 'Clicks', local_hour=local_hour)
             if a: alerts.append(a)
 
         if t['registrations']['yesterday'] >= REG_01_ELIGIBLE_REGS_YDAY:
@@ -306,7 +358,8 @@ def run_once():
             reg_window = dynamic_window(reg_window, t['registrations']['yesterday'])
             a = check_project_metric(state, now, pid, label, 'registrations', t['registrations']['today'],
                                       reg_window, 'REG-01', 'Registrations',
-                                      f" (window={reg_window}h, yesterday's regs={t['registrations']['yesterday']:.0f})")
+                                      f" (window={reg_window}h, yesterday's regs={t['registrations']['yesterday']:.0f})",
+                                      local_hour=local_hour)
             if a: alerts.append(a)
 
         if t['ftds']['yesterday'] >= FTD_01_ELIGIBLE_FTDS_YDAY:
@@ -314,13 +367,14 @@ def run_once():
             ftd_window = dynamic_window(ftd_window, t['ftds']['yesterday'])
             a = check_project_metric(state, now, pid, label, 'ftds', t['ftds']['today'],
                                       ftd_window, 'FTD-01', 'FTDs',
-                                      f" (window={ftd_window}h, yesterday's FTDs={t['ftds']['yesterday']:.0f})")
+                                      f" (window={ftd_window}h, yesterday's FTDs={t['ftds']['yesterday']:.0f})",
+                                      local_hour=local_hour)
             if a: alerts.append(a)
 
         if t['deposits']['yesterday'] >= DEP_01_ELIGIBLE_DEPOSITS_YDAY:
             dep_window = dynamic_window(DEP_01_WINDOW_H, t['deposits']['yesterday'])
             a = check_project_metric(state, now, pid, label, 'deposits', t['deposits']['today'],
-                                      dep_window, 'DEP-01', 'Deposit events')
+                                      dep_window, 'DEP-01', 'Deposit events', local_hour=local_hour)
             if a: alerts.append(a)
 
         for feed in DAT_01_FEEDS:
@@ -329,7 +383,7 @@ def run_once():
             feed_window = dynamic_window(DAT_01_WINDOW_H, t[feed]['yesterday'])
             key = f'{pid}|{feed}|Project'
             hist = append_snapshot(state, key, now, t[feed]['today'])
-            triggered, old_v, latest_v, had_history = had_no_increase_in(hist, now, feed_window)
+            triggered, old_v, latest_v, had_history = had_no_increase_in(hist, now, feed_window, local_hour=local_hour)
             if triggered:
                 alerts.append({
                     'rule_id': 'DAT-01', 'metric': f'Data freshness ({feed})', 'level': 'Project',
@@ -364,9 +418,9 @@ def run_once():
                 # either base) - consistent now, with headroom if the floor is ever lowered.
                 clk17_warn_window = dynamic_window(CLK_17_WARN_H, lp_yday_c)
                 clk17_crit_window = dynamic_window(CLK_17_CRIT_H, lp_yday_c)
-                trig_warn, old_v, latest_v, _ = had_no_increase_in(hist, now, clk17_warn_window)
+                trig_warn, old_v, latest_v, _ = had_no_increase_in(hist, now, clk17_warn_window, local_hour=local_hour)
                 if trig_warn:
-                    trig_crit, _, _, _ = had_no_increase_in(hist, now, clk17_crit_window)
+                    trig_crit, _, _, _ = had_no_increase_in(hist, now, clk17_crit_window, local_hour=local_hour)
                     window_shown = clk17_crit_window if trig_crit else clk17_warn_window
                     alerts.append({
                         'rule_id': 'CLK-17', 'metric': 'Clicks', 'level': 'Landing Page',

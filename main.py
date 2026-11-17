@@ -80,7 +80,10 @@ DAT_01_FEEDS = ('clicks', 'registrations', 'ftds', 'deposits')
 CLK_01_ELIGIBLE_CLICKS_YDAY = 100
 DEP_01_ELIGIBLE_DEPOSITS_YDAY = 10
 DAT_01_FEED_FLOORS = {'clicks': CLK_01_ELIGIBLE_CLICKS_YDAY, 'registrations': 5,
-                       'ftds': 2, 'deposits': DEP_01_ELIGIBLE_DEPOSITS_YDAY}
+                       'deposits': DEP_01_ELIGIBLE_DEPOSITS_YDAY}  # 'ftds' added below, once
+                       # FTD_01_ELIGIBLE_FTDS_YDAY exists - was a separate hardcoded "2" before
+                       # the 2026-11-17 floor raise, which could have drifted from that constant;
+                       # referencing it here instead makes that impossible going forward.
 # REG-01/FTD-01 already widen their window on a low-volume day (2h->4h, 3h->6h) - but a
 # WIDER window doesn't help when yesterday's volume is literally 0 (confirmed live: several
 # of the same noisy alerts above read "yesterday's regs=0"/"yesterday's FTDs=0" in their own
@@ -88,7 +91,28 @@ DAT_01_FEED_FLOORS = {'clicks': CLK_01_ELIGIBLE_CLICKS_YDAY, 'registrations': 5,
 # second, separate eligibility floor on top of the existing window-width adaptation, not a
 # replacement for it.
 REG_01_ELIGIBLE_REGS_YDAY = 5
-FTD_01_ELIGIBLE_FTDS_YDAY = 2
+# Raised 2->5 on 2026-11-17 (real production evidence, first full day live): Brazino777.in's
+# FTD-01/DAT-01(ftds) fired for 8 straight hours, every day, because yesterday's FTDs=2 means
+# the window formula is already at its 12h cap - the metric is structurally too lumpy at this
+# volume for ANY same-day window to tell "normal spacing" from "dead". .in's own FTD volume
+# ranges ~2-5/day (seen both in this window), so 5 excludes it on its thinnest days and still
+# checks it, properly patience-scaled, on its fuller ones - not an invented number, the
+# project's own real range.
+FTD_01_ELIGIBLE_FTDS_YDAY = 5
+DAT_01_FEED_FLOORS['ftds'] = FTD_01_ELIGIBLE_FTDS_YDAY
+
+# "Hasn't started yet" grace period, added 2026-11-17 (real production evidence): 3 separate
+# projects (including Brazino777.io, a healthy 533-regs/day project) fired REG-01/DEP-01 at
+# 02:00 reading "was 0.0, still 0.0" - the dynamic window above only accounts for how LOW a
+# day's volume is, not WHEN in the day it typically starts. A comparison baseline of exactly 0
+# means literally nothing has happened yet today by that point - indistinguishable from "dead"
+# until enough of the day has passed, regardless of how much yesterday's volume justifies a
+# short window. Confirmed by this project's own earlier per-project/metric measurement: every
+# project's clicks/registrations/FTDs/deposits are reliably nonzero by hour 3-4 server time on
+# an ordinary day - 5 gives a margin past that. Only applies when the comparison baseline is
+# exactly 0 (nothing started yet); once something has ticked and then gone flat, the existing
+# dynamic window keeps applying at any hour.
+GRACE_UNTIL_HOUR = 5
 
 # Dynamic patience window added 2026-11-16 (same change, same evidence, as
 # Documents/traffic/health_check/intraday_check.py's own identical addition - this repo
@@ -154,7 +178,7 @@ def append_result(record):
 # ------------------------------------------------------------- pure check logic
 # (identical to intraday_check.py's own had_no_increase_in() - see that file for the
 # full reasoning on the same-calendar-day guard)
-def had_no_increase_in(history, as_of, hours):
+def had_no_increase_in(history, as_of, hours, grace_until_hour=GRACE_UNTIL_HOUR):
     today = as_of.date()
     same_day = sorted((t, v) for t, v in history if t.date() == today and t <= as_of)
     if not same_day:
@@ -165,6 +189,12 @@ def had_no_increase_in(history, as_of, hours):
     if not candidates:
         return False, None, latest_v, False
     old_t, old_v = max(candidates, key=lambda tv: tv[0])
+    if old_v == 0 and grace_until_hour is not None and as_of.hour < grace_until_hour:
+        # Nothing has happened yet today as of the comparison point - "hasn't started" and
+        # "dead" look identical until enough of the day has passed, so don't fire yet. Once
+        # old_v > 0 (something ticked, then went flat) this grace no longer applies, at any
+        # hour - see GRACE_UNTIL_HOUR's own comment for the real evidence behind this.
+        return False, old_v, latest_v, True
     return (latest_v <= old_v), old_v, latest_v, True
 
 
@@ -326,15 +356,24 @@ def run_once():
             if lp_yday_c >= CLK_17_ELIGIBLE_CLICKS_YDAY:
                 key = f'{pid}|clicks|{lp_label}'
                 hist = append_snapshot(state, key, now, float(today_c.get(lid, 0.0)))
-                trig_warn, old_v, latest_v, _ = had_no_increase_in(hist, now, CLK_17_WARN_H)
+                # Dynamic-scaled 2026-11-17, same formula/reasoning as the project-level rules
+                # (see dynamic_window()'s own docstring) - an LP right at the 100-click
+                # eligibility floor shouldn't get the same 2h/6h patience as one doing
+                # thousands/day. In practice this floor is already high enough that neither
+                # window moves for any LP currently eligible (24/100*1.5=0.36h, nowhere near
+                # either base) - consistent now, with headroom if the floor is ever lowered.
+                clk17_warn_window = dynamic_window(CLK_17_WARN_H, lp_yday_c)
+                clk17_crit_window = dynamic_window(CLK_17_CRIT_H, lp_yday_c)
+                trig_warn, old_v, latest_v, _ = had_no_increase_in(hist, now, clk17_warn_window)
                 if trig_warn:
-                    trig_crit, _, _, _ = had_no_increase_in(hist, now, CLK_17_CRIT_H)
+                    trig_crit, _, _, _ = had_no_increase_in(hist, now, clk17_crit_window)
+                    window_shown = clk17_crit_window if trig_crit else clk17_warn_window
                     alerts.append({
                         'rule_id': 'CLK-17', 'metric': 'Clicks', 'level': 'Landing Page',
                         'entity': lp_label, 'project_id': pid, 'value': latest_v, 'baseline': old_v,
                         'severity': 'CRITICAL' if trig_crit else 'WARNING',
                         'note': f"LP had {lp_yday_c:.0f} clicks yesterday (eligible); "
-                                f"no increase in >= {CLK_17_CRIT_H if trig_crit else CLK_17_WARN_H}h",
+                                f"no increase in >= {window_shown:.1f}h",
                     })
 
             if lp_yday_c >= REG_17_ELIGIBLE_CLICKS_YDAY and lp_yday_r >= REG_17_ELIGIBLE_REGS_YDAY:
@@ -342,8 +381,14 @@ def run_once():
                 r_key = f'{pid}|registrations|{lp_label}'
                 c_hist = append_snapshot(state, c_key, now, float(today_c.get(lid, 0.0)))
                 r_hist = append_snapshot(state, r_key, now, float(today_r.get(lid, 0.0)))
+                # Dynamic-scaled 2026-11-17, same reasoning as CLK-17 above - scaled by this
+                # LP's own yesterday registrations (the metric REG-17 is actually waiting on),
+                # not its clicks. Floor (regs>=30) already keeps this moot in practice
+                # (24/30*1.5=1.2h, under both bases) - consistency/headroom, same as CLK-17.
+                reg17_warn_window = dynamic_window(REG_17_WARN_H, lp_yday_r)
+                reg17_crit_window = dynamic_window(REG_17_CRIT_H, lp_yday_r)
                 today_lw = now.date()
-                cutoff_warn = now - pd.Timedelta(hours=float(REG_17_WARN_H))
+                cutoff_warn = now - pd.Timedelta(hours=float(reg17_warn_window))
                 c_same_day = sorted((t2, v) for t2, v in c_hist if t2.date() == today_lw and t2 <= now)
                 r_same_day = sorted((t2, v) for t2, v in r_hist if t2.date() == today_lw and t2 <= now)
                 c_before = [(t2, v) for t2, v in c_same_day if t2 <= cutoff_warn]
@@ -352,14 +397,14 @@ def run_once():
                     c_delta = c_same_day[-1][1] - max(c_before, key=lambda tv: tv[0])[1]
                     r_delta = r_same_day[-1][1] - max(r_before, key=lambda tv: tv[0])[1]
                     if c_delta >= REG_17_MIN_CLICKS_IN_WINDOW and r_delta == 0:
-                        cutoff_crit = now - pd.Timedelta(hours=float(REG_17_CRIT_H))
+                        cutoff_crit = now - pd.Timedelta(hours=float(reg17_crit_window))
                         r_before_crit = [(t2, v) for t2, v in r_same_day if t2 <= cutoff_crit]
-                        still_zero_6h = bool(r_before_crit) and r_same_day[-1][1] == max(r_before_crit, key=lambda tv: tv[0])[1]
+                        still_zero_crit = bool(r_before_crit) and r_same_day[-1][1] == max(r_before_crit, key=lambda tv: tv[0])[1]
                         alerts.append({
                             'rule_id': 'REG-17', 'metric': 'Registrations', 'level': 'Landing Page',
                             'entity': lp_label, 'project_id': pid, 'value': 0, 'baseline': c_delta,
-                            'severity': 'CRITICAL' if still_zero_6h else 'WARNING',
-                            'note': f'{c_delta:.0f} clicks in the last {REG_17_WARN_H}h, 0 registrations',
+                            'severity': 'CRITICAL' if still_zero_crit else 'WARNING',
+                            'note': f'{c_delta:.0f} clicks in the last {reg17_warn_window:.1f}h, 0 registrations',
                         })
 
     save_state(state)

@@ -10,7 +10,7 @@ import os
 from typing import List
 
 import alert_render
-from alert_types import Alert
+from alert_types import Alert, PLATFORM
 
 TELEGRAM_CHAR_LIMIT = 4096
 
@@ -80,3 +80,46 @@ def send_for_date(alerts: List[Alert], date: str, force: bool = False):
     messages = render_html_messages(alerts, date)
     dhc.send_telegram_for_date(date, messages, force=force)
     return messages
+
+
+# ================================================================= per-AM chat routing
+# Added 2026-11-17 (user: "create a group of chats on telegram and have one chat for each AM to
+# simulate exactly what they get"). Each AM's chat should see: their own alerts (Alert.owner ==
+# that AM's name) plus every PLATFORM-level alert (the same "Not partner-specific" broadcast
+# every AM already sees inside the single shared chat via send_for_date() above) - never
+# UNASSIGNED alerts, which have no owner to route to. This reuses render_html_messages()
+# unchanged, so a chat's content is rendered by the exact same code path as the real shared
+# message - "simulate exactly what they get" is true by construction, not by separately
+# maintaining a second renderer that could drift from the first.
+#
+# AM name must match Alert.owner exactly - alert_mapping.py sets owner from
+# daily_health_check.fetch_account_managers()'s own partner_tags title spelling/case. Only AMs
+# with a real test chat set up so far are listed; every other AM's alerts still only reach the
+# single shared TELEGRAM_CHAT_ID via send_for_date(), unaffected by this - additive, not a
+# replacement for the existing send.
+AM_TELEGRAM_CHATS = {
+    'jackie': -5487009071,
+    'Fotini': -5195990482,
+    'Willard': -5544224465,
+    'Christie': -5420792053,
+}
+
+
+def send_am_chat_messages(alerts: List[Alert], date: str):
+    """Splits `alerts` per configured AM (AM_TELEGRAM_CHATS) and sends each AM's own
+    personal+global digest to their own Telegram chat - additive alongside send_for_date()'s
+    existing single shared-chat send, not a replacement for it. An AM with nothing of their own
+    AND no PLATFORM-level alerts today gets nothing sent (no empty "quiet day" message - matches
+    build_sections()'s own behavior of simply omitting an owner with zero alerts). Returns
+    {am_name: messages_sent} for the AMs that had something to send."""
+    import daily_health_check as dhc
+    out = {}
+    for am, chat_id in AM_TELEGRAM_CHATS.items():
+        subset = [a for a in alerts if a.owner == am or a.owner == PLATFORM]
+        if not subset:
+            continue
+        messages = render_html_messages(subset, date)
+        out[am] = messages
+        for msg in messages:
+            dhc.send_telegram_to_chat(msg, chat_id)
+    return out

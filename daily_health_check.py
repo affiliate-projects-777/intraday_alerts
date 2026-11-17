@@ -1423,6 +1423,30 @@ def send_telegram(text):
         return False
 
 
+def send_telegram_to_chat(text, chat_id):
+    """Same as send_telegram() but to an explicit chat_id instead of the shared
+    TELEGRAM_CHAT_ID - added 2026-11-17 for per-AM chat routing (see alert_telegram.py's
+    AM_TELEGRAM_CHATS/send_am_chat_messages()). Only TELEGRAM_BOT_TOKEN is required here (the
+    chat is passed in, not read from env) - everything else (HTML parse_mode, the 200-check)
+    matches send_telegram() exactly."""
+    token = os.environ.get('TELEGRAM_BOT_TOKEN')
+    if not token:
+        log("Telegram not configured (TELEGRAM_BOT_TOKEN missing from .env) - skipping send")
+        return False
+    try:
+        import requests
+        resp = requests.post(f'https://api.telegram.org/bot{token}/sendMessage',
+                              data={'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}, timeout=15)
+        if resp.status_code == 200:
+            log(f"Telegram message sent to chat {chat_id}")
+            return True
+        log(f"Telegram send to chat {chat_id} failed: {resp.status_code} {resp.text}")
+        return False
+    except Exception as e:
+        log(f"Telegram send to chat {chat_id} failed (non-fatal): {e}")
+        return False
+
+
 def _load_sent_log():
     if not os.path.exists(SENT_LOG_PATH):
         return {}
@@ -1677,6 +1701,10 @@ def main():
     # make the message header read "2026-11-11 00:00:00", not "2026-11-11".
     typed_alerts = map_alerts(all_alerts, am_map, partner_names, p4_breakdown_dict, str(eval_date.date()))
     send_for_date(typed_alerts, str(eval_date.date()))
+    # Per-AM chat routing (added 2026-11-17, see alert_telegram.py's AM_TELEGRAM_CHATS) -
+    # additive alongside the shared-chat send above, not a replacement for it.
+    from alert_telegram import send_am_chat_messages
+    send_am_chat_messages(typed_alerts, str(eval_date.date()))
 
     if total_actionable > 0:
         notify_windows('Daily health check', f'{total_actionable} actionable alert(s) for {eval_date.date()} - see the report')

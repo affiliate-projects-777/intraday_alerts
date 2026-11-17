@@ -396,6 +396,41 @@ def fetch_lp_totals(engine, pid, today, yesterday):
     return today_c, today_r, yday_c, yday_r
 
 
+def lp_dominant_partner_am(engine, landing_id, today, metric_col):
+    """For one landing page, which partner drove the most of `metric_col` (clicks or
+    registrations) today, and that partner's AM - added 2026-11-17 for per-AM chat routing (see
+    AM_TELEGRAM_CHATS) on the CLK-17/REG-17 rules. Reuses
+    daily_health_check.fetch_account_managers() (the exact same partner_tags lookup the daily
+    pipeline already uses) rather than re-deriving AM resolution here. A landing page can carry
+    many partners - confirmed live, landing_394 alone has 6 - this names only the DOMINANT one
+    by today's volume, same "note the likely driver, don't claim exclusive ownership" precedent
+    as the daily pipeline's own dominant_partner enrichment
+    (health_check_engine.annotate_project_dominant_partner()). Returns (am_or_None, partner_id_
+    or_None, share_pct, other_partners_count) - am is None when there's no traffic yet today on
+    this LP, or the dominant partner has no AM tag."""
+    q = text(f"""
+        SELECT p.partner_id AS partner_id, SUM(ps.{metric_col}) AS v
+        FROM promo_statistics ps
+        JOIN promo p ON p.id = ps.promo_id
+        WHERE p.landing_id = :landing_id AND ps.date = :today
+        GROUP BY p.partner_id
+        HAVING v > 0
+        ORDER BY v DESC
+    """)
+    with engine.connect() as conn:
+        df = pd.read_sql(q, conn, params={'landing_id': int(landing_id), 'today': today})
+    if df.empty:
+        return None, None, 0.0, 0
+    total = float(df['v'].sum())
+    top_partner = int(df.iloc[0]['partner_id'])
+    share_pct = float(df.iloc[0]['v']) / total * 100.0 if total else 0.0
+    other_count = len(df) - 1
+    import daily_health_check as dhc
+    am_map = dhc.fetch_account_managers([top_partner])
+    am = am_map.get(top_partner)
+    return am, top_partner, share_pct, other_count
+
+
 # ------------------------------------------------------------- rule evaluators
 def check_project_metric(state, now, pid, label, metric, value_today, window_hours, rule_id, metric_label,
                           note_extra='', local_hour=None, entity_key='Project', level='Project'):
@@ -526,12 +561,21 @@ def run_once():
                 if trig_warn:
                     trig_crit, _, _, _ = had_no_increase_in(hist, now, clk17_crit_window, local_hour=local_hour)
                     window_shown = clk17_crit_window if trig_crit else clk17_warn_window
+                    # Dominant-partner attribution, added 2026-11-17 for per-AM chat routing
+                    # (see AM_TELEGRAM_CHATS) - who this LP's alert is "about them" for, since
+                    # an LP itself can carry many partners (see lp_dominant_partner_am()'s own
+                    # comment). Only queried when an alert is actually firing, not per LP checked.
+                    am, dom_partner, dom_share, other_partners = lp_dominant_partner_am(engine, lid, today, 'clicks')
+                    note = (f"LP had {lp_yday_c:.0f} clicks yesterday (eligible); "
+                            f"no increase in >= {window_shown:.1f}h")
+                    if dom_partner is not None:
+                        note += (f" (mostly partner_{dom_partner}, {dom_share:.0f}% of today's clicks"
+                                 + (f"; {other_partners} other partner(s) also on this LP" if other_partners else "") + ")")
                     alerts.append({
                         'rule_id': 'CLK-17', 'metric': 'Clicks', 'level': 'Landing Page',
                         'entity': lp_label, 'project_id': pid, 'value': latest_v, 'baseline': old_v,
                         'severity': 'CRITICAL' if trig_crit else 'WARNING',
-                        'note': f"LP had {lp_yday_c:.0f} clicks yesterday (eligible); "
-                                f"no increase in >= {window_shown:.1f}h",
+                        'note': note, 'am': am, 'dominant_partner': dom_partner,
                     })
 
             if lp_yday_c >= REG_17_ELIGIBLE_CLICKS_YDAY and lp_yday_r >= REG_17_ELIGIBLE_REGS_YDAY:
@@ -558,11 +602,21 @@ def run_once():
                         cutoff_crit = now - pd.Timedelta(hours=float(reg17_crit_window))
                         r_before_crit = [(t2, v) for t2, v in r_same_day if t2 <= cutoff_crit]
                         still_zero_crit = bool(r_before_crit) and r_same_day[-1][1] == max(r_before_crit, key=lambda tv: tv[0])[1]
+                        # Dominant-partner attribution (clicks, not registrations - clicks are
+                        # the metric actually flowing on this LP; registrations are the broken
+                        # one, so attributing by clicks names whose traffic isn't converting,
+                        # not an arbitrary near-zero registrations split). See CLK-17's own
+                        # comment above for the full reasoning.
+                        am, dom_partner, dom_share, other_partners = lp_dominant_partner_am(engine, lid, today, 'clicks')
+                        note = f'{c_delta:.0f} clicks in the last {reg17_warn_window:.1f}h, 0 registrations'
+                        if dom_partner is not None:
+                            note += (f" (mostly partner_{dom_partner}, {dom_share:.0f}% of today's clicks"
+                                     + (f"; {other_partners} other partner(s) also on this LP" if other_partners else "") + ")")
                         alerts.append({
                             'rule_id': 'REG-17', 'metric': 'Registrations', 'level': 'Landing Page',
                             'entity': lp_label, 'project_id': pid, 'value': 0, 'baseline': c_delta,
                             'severity': 'CRITICAL' if still_zero_crit else 'WARNING',
-                            'note': f'{c_delta:.0f} clicks in the last {reg17_warn_window:.1f}h, 0 registrations',
+                            'note': note, 'am': am, 'dominant_partner': dom_partner,
                         })
 
     save_state(state)
@@ -595,6 +649,60 @@ def send_telegram(text):
         return False
 
 
+def send_telegram_to_chat(text, chat_id):
+    """Same as send_telegram() but to an explicit chat_id instead of the shared
+    TELEGRAM_CHAT_ID - added 2026-11-17 for per-AM chat routing (see AM_TELEGRAM_CHATS below)."""
+    token = os.environ.get('TELEGRAM_BOT_TOKEN')
+    if not token:
+        logging.info("Telegram not configured (TELEGRAM_BOT_TOKEN missing) - skipping send")
+        return False
+    try:
+        import requests
+        resp = requests.post(f'https://api.telegram.org/bot{token}/sendMessage',
+                              data={'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}, timeout=15)
+        if resp.status_code == 200:
+            logging.info(f"Telegram message sent to chat {chat_id}")
+            return True
+        logging.error(f"Telegram send to chat {chat_id} failed: {resp.status_code} {resp.text}")
+        return False
+    except Exception as e:
+        logging.error(f"Telegram send to chat {chat_id} failed (non-fatal): {e}")
+        return False
+
+
+# ================================================================= per-AM chat routing
+# Added 2026-11-17 (user: "create a group of chats on telegram and have one chat for each AM to
+# simulate exactly what they get"), same AM names/chat ids as the daily pipeline's own
+# alert_telegram.py:AM_TELEGRAM_CHATS - kept as two separate dicts (not imported from one
+# another) since this repo already duplicates daily_health_check.py verbatim rather than sharing
+# code across the two jobs, per this repo's own established convention (see this file's header).
+AM_TELEGRAM_CHATS = {
+    'jackie': -5487009071,
+    'Fotini': -5195990482,
+    'Willard': -5544224465,
+    'Christie': -5420792053,
+}
+
+
+def send_am_chat_messages(alerts, now):
+    """Splits `alerts` per configured AM and sends each AM's own personal+global digest to their
+    own Telegram chat - additive alongside the existing single shared-chat send in __main__, not
+    a replacement for it. Personal = CLK-17/REG-17 alerts whose dominant partner (see
+    lp_dominant_partner_am()) is that AM's own; global = every project-level alert
+    (CLK-01/REG-01/FTD-01/DEP-01/DAT-01 - always market-wide, never personally attributed, same
+    precedent as the daily pipeline never routing a PLATFORM-scope alert to one AM) plus any
+    LP-level alert whose dominant partner has no AM tag (nowhere else for it to go). An AM with
+    neither today sees nothing sent, same "zero alerts -> send nothing" rule this hourly job
+    already follows for the shared chat."""
+    global_alerts = [a for a in alerts if a.get('am') is None]
+    for am, chat_id in AM_TELEGRAM_CHATS.items():
+        personal = [a for a in alerts if a.get('am') == am]
+        subset = personal + global_alerts
+        if not subset:
+            continue
+        send_telegram_to_chat(format_hourly_message(subset, now), chat_id)
+
+
 def format_hourly_message(alerts, now):
     """One message per hourly run, grouped by project - resent every hour an issue stays open
     (user's own choice, 2026-11-16: no new-vs-still-open distinction here, unlike the daily
@@ -621,7 +729,9 @@ if __name__ == '__main__':
         for a in found:
             logging.warning(f"ALERT {a['rule_id']} {a['level']} {a['entity']}: {a['note']}")
         if found:
-            send_telegram(format_hourly_message(found, datetime.now()))
+            now = datetime.now()
+            send_telegram(format_hourly_message(found, now))
+            send_am_chat_messages(found, now)
     except Exception as e:
         logging.error(f"Run failed: {e}")
         raise

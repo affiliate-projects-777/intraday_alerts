@@ -77,7 +77,12 @@ EXCLUDED_TAG_IDS = (1, 33, 34, 37, 41)
 CLK_01_WINDOW_H = 2
 CLK_17_WARN_H, CLK_17_CRIT_H, CLK_17_ELIGIBLE_CLICKS_YDAY = 2, 6, 100
 REG_01_WINDOW_LOW_H, REG_01_WINDOW_HIGH_H, REG_01_LOW_FLOOR_YDAY = 2, 4, 100
-REG_17_WARN_H, REG_17_CRIT_H, REG_17_MIN_CLICKS_IN_WINDOW = 3, 6, 30
+# REG_17_WARN_H raised 3->4 on 2026-11-17 (user: "make sure that the alerts are correct...
+# after 4h no regs in 4h instead of 3", following a live landing_394 investigation: clicks kept
+# climbing (3.3k -> 8.7k+ in the window) while registrations sat flat all day (0->1 by 03:00,
+# 1->3 sometime before 14:00, then flat through 16:00+) - a real, severe conversion break, not a
+# false positive, but the user's own call was that 3h wasn't enough patience before WARNING.
+REG_17_WARN_H, REG_17_CRIT_H, REG_17_MIN_CLICKS_IN_WINDOW = 4, 6, 30
 # REG_17_ELIGIBLE_REGS_YDAY raised 2026-11-16 (finding: 85% of hourly runs fired an alert,
 # most of it noise) - confirmed real: with a 10/day floor, a LP can legitimately have a
 # 3-hour gap with zero registrations just from normal spacing, not a broken handoff. 30/day

@@ -27,6 +27,16 @@ GRACE_UNTIL_HOUR now means 5am in EACH project's own local time, not this contai
 server time (TZ=Europe/Athens) - the "same calendar day"/window-width logic is untouched and
 still runs on server time throughout; only the grace gate's hour comparison is localized per
 project. See PROJECT_TIMEZONES/local_hour_for().
+
+Project 4 (Brazino777.io) per-country split (added 2026-11-17, same day, user-confirmed country
+list: "io is Argentina, Bolivia, Chile, Colombia, Ecuador and Venezuela"): a single project-level
+check for project 4 would either average away each country's own real volume or apply the wrong
+one's timezone to the rest, so CLK-01/REG-01/FTD-01/DEP-01/DAT-01 run ONCE PER COUNTRY for
+project 4 instead - same floors/windows/grace as any other project, just computed from that
+country's own today/yesterday totals and its own local hour. See P4_COUNTRIES/
+P4_COUNTRY_TIMEZONES/fetch_p4_country_totals()/run_project_level_rules(). LP-level rules
+(CLK-17/REG-17) are NOT split this way - a landing page has no country field joined here, so
+project 4's LPs still fall back to this container's own Athens hour (unchanged).
 """
 import os
 import sys
@@ -150,12 +160,79 @@ PROJECT_TIMEZONES = {
 def local_hour_for(now, tz_name):
     """Converts `now` (this container's naive wall-clock time, i.e. Athens - TZ=Europe/Athens)
     to `tz_name`'s own local hour, for the grace period's "is it night there" check. Returns
-    Athens' own hour unconverted when tz_name is None (project 4 - see PROJECT_TIMEZONES'
-    comment)."""
+    Athens' own hour unconverted when tz_name is None (project 4's LP-level fallback - see
+    PROJECT_TIMEZONES' comment)."""
     if tz_name is None:
         return now.hour
     aware = now.tz_localize('Europe/Athens') if now.tzinfo is None else now.tz_convert('Europe/Athens')
     return aware.tz_convert(tz_name).hour
+
+
+# Project 4 (Brazino777.io) per-country split, added 2026-11-17 (user-confirmed: "io is
+# Argentina, Bolivia, Chile, Colombia, Ecuador and Venezuela" - matches the traffic repo's own
+# P4_COUNTRIES, not invented here). A single project-level check for project 4 would mix 6
+# countries' volume/timezone together - CLK-01/REG-01/FTD-01/DEP-01/DAT-01 run once per country
+# for this project instead, via run_project_level_rules() below. LP-level rules (CLK-17/REG-17)
+# are NOT split this way - a landing page has no country field joined here, so project 4's LPs
+# still fall back to this container's own Athens hour (local_hour_for(now, None)).
+P4_COUNTRIES = ('AR', 'BO', 'CL', 'CO', 'EC', 'VE')
+P4_COUNTRY_TIMEZONES = {
+    'AR': 'America/Argentina/Buenos_Aires',
+    'BO': 'America/La_Paz',
+    'CL': 'America/Santiago',
+    'CO': 'America/Bogota',
+    'EC': 'America/Guayaquil',
+    'VE': 'America/Caracas',
+}
+
+
+def fetch_p4_country_totals(engine, today, yesterday):
+    """Project 4's clicks/registrations/FTDs/deposit-events by country, today vs yesterday -
+    dedicated queries (promo_statistics_countries has country+promo_id directly;
+    projects_statistics has a country column fetch_project_totals() doesn't select, same
+    precedent as Documents/traffic/health_check/daily_health_check.py's own
+    fetch_p4_country_breakdown()). Always returns all 6 countries (0.0 where a country had no
+    rows that day), same shape fetch_project_totals() returns per project."""
+    excl = ','.join(str(t) for t in EXCLUDED_TAG_IDS)
+    countries_sql = ','.join(f"'{c}'" for c in P4_COUNTRIES)
+
+    click_reg_q = text(f"""
+        SELECT psc.country AS country, psc.date AS date,
+               SUM(psc.clicks) AS clicks, SUM(psc.registrations) AS registrations
+        FROM promo_statistics_countries psc
+        JOIN promo p ON p.id = psc.promo_id
+        JOIN promo_materials pm ON p.promo_material_id = pm.id
+        WHERE pm.project_id = 4 AND psc.date IN (:today, :yesterday)
+          AND psc.country IN ({countries_sql})
+          AND p.partner_id NOT IN (SELECT partner_id FROM partner_tags_ref WHERE tag_id IN ({excl}))
+        GROUP BY psc.country, psc.date
+    """)
+    ftd_dep_q = text(f"""
+        SELECT country, date, SUM(is_first_depositor) AS ftds, SUM(number_of_deposits) AS deposits
+        FROM projects_statistics
+        WHERE project_id = 4 AND date IN (:today, :yesterday) AND country IN ({countries_sql})
+          AND partner_id NOT IN (SELECT partner_id FROM partner_tags_ref WHERE tag_id IN ({excl}))
+        GROUP BY country, date
+    """)
+    with engine.connect() as conn:
+        cr_df = pd.read_sql(click_reg_q, conn, params={'today': today, 'yesterday': yesterday})
+        fd_df = pd.read_sql(ftd_dep_q, conn, params={'today': today, 'yesterday': yesterday})
+
+    def day_val(df, country, col, d):
+        if df.empty:
+            return 0.0
+        row = df[(df['country'] == country) & (df['date'] == d)]
+        return float(row[col].sum()) if not row.empty else 0.0
+
+    return {
+        c: {
+            'clicks': {'today': day_val(cr_df, c, 'clicks', today), 'yesterday': day_val(cr_df, c, 'clicks', yesterday)},
+            'registrations': {'today': day_val(cr_df, c, 'registrations', today), 'yesterday': day_val(cr_df, c, 'registrations', yesterday)},
+            'ftds': {'today': day_val(fd_df, c, 'ftds', today), 'yesterday': day_val(fd_df, c, 'ftds', yesterday)},
+            'deposits': {'today': day_val(fd_df, c, 'deposits', today), 'yesterday': day_val(fd_df, c, 'deposits', yesterday)},
+        }
+        for c in P4_COUNTRIES
+    }
 
 
 # Dynamic patience window added 2026-11-16 (same change, same evidence, as
@@ -315,17 +392,72 @@ def fetch_lp_totals(engine, pid, today, yesterday):
 
 
 # ------------------------------------------------------------- rule evaluators
-def check_project_metric(state, now, pid, label, metric, value_today, window_hours, rule_id, metric_label, note_extra='', local_hour=None):
-    key = f'{pid}|{metric}|Project'
+def check_project_metric(state, now, pid, label, metric, value_today, window_hours, rule_id, metric_label,
+                          note_extra='', local_hour=None, entity_key='Project', level='Project'):
+    key = f'{pid}|{metric}|{entity_key}'
     hist = append_snapshot(state, key, now, value_today)
     triggered, old_v, latest_v, had_history = had_no_increase_in(hist, now, window_hours, local_hour=local_hour)
     if not triggered:
         return None
     return {
-        'rule_id': rule_id, 'metric': metric_label, 'level': 'Project', 'entity': label,
+        'rule_id': rule_id, 'metric': metric_label, 'level': level, 'entity': label,
         'project_id': pid, 'value': latest_v, 'baseline': old_v, 'severity': 'CRITICAL',
         'note': f'no increase in >= {window_hours}h (was {old_v}, still {latest_v})' + note_extra,
     }
+
+
+def run_project_level_rules(state, now, pid, label, t, local_hour, alerts, entity_key='Project', level='Project'):
+    """Runs CLK-01/REG-01/FTD-01/DEP-01/DAT-01 for one project-level entity - a whole project for
+    every project except 4, or (project 4 only, see P4_COUNTRIES) one of its countries, each with
+    its own totals/local_hour/state history (`entity_key` keeps a country's snapshot history
+    separate from every other country's and from a plain project's). Appends any fired alerts to
+    `alerts` in place."""
+    if t['clicks']['yesterday'] >= CLK_01_ELIGIBLE_CLICKS_YDAY:
+        clk_window = dynamic_window(CLK_01_WINDOW_H, t['clicks']['yesterday'])
+        a = check_project_metric(state, now, pid, label, 'clicks', t['clicks']['today'],
+                                  clk_window, 'CLK-01', 'Clicks', local_hour=local_hour,
+                                  entity_key=entity_key, level=level)
+        if a: alerts.append(a)
+
+    if t['registrations']['yesterday'] >= REG_01_ELIGIBLE_REGS_YDAY:
+        reg_window = REG_01_WINDOW_HIGH_H if t['registrations']['yesterday'] < REG_01_LOW_FLOOR_YDAY else REG_01_WINDOW_LOW_H
+        reg_window = dynamic_window(reg_window, t['registrations']['yesterday'])
+        a = check_project_metric(state, now, pid, label, 'registrations', t['registrations']['today'],
+                                  reg_window, 'REG-01', 'Registrations',
+                                  f" (window={reg_window}h, yesterday's regs={t['registrations']['yesterday']:.0f})",
+                                  local_hour=local_hour, entity_key=entity_key, level=level)
+        if a: alerts.append(a)
+
+    if t['ftds']['yesterday'] >= FTD_01_ELIGIBLE_FTDS_YDAY:
+        ftd_window = FTD_01_WINDOW_HIGH_H if t['ftds']['yesterday'] < FTD_01_LOW_FLOOR_YDAY else FTD_01_WINDOW_LOW_H
+        ftd_window = dynamic_window(ftd_window, t['ftds']['yesterday'])
+        a = check_project_metric(state, now, pid, label, 'ftds', t['ftds']['today'],
+                                  ftd_window, 'FTD-01', 'FTDs',
+                                  f" (window={ftd_window}h, yesterday's FTDs={t['ftds']['yesterday']:.0f})",
+                                  local_hour=local_hour, entity_key=entity_key, level=level)
+        if a: alerts.append(a)
+
+    if t['deposits']['yesterday'] >= DEP_01_ELIGIBLE_DEPOSITS_YDAY:
+        dep_window = dynamic_window(DEP_01_WINDOW_H, t['deposits']['yesterday'])
+        a = check_project_metric(state, now, pid, label, 'deposits', t['deposits']['today'],
+                                  dep_window, 'DEP-01', 'Deposit events', local_hour=local_hour,
+                                  entity_key=entity_key, level=level)
+        if a: alerts.append(a)
+
+    for feed in DAT_01_FEEDS:
+        if t[feed]['yesterday'] < DAT_01_FEED_FLOORS[feed]:
+            continue  # below this feed's own volume floor - "flat" is normal, not a signal
+        feed_window = dynamic_window(DAT_01_WINDOW_H, t[feed]['yesterday'])
+        key = f'{pid}|{feed}|{entity_key}'
+        hist = append_snapshot(state, key, now, t[feed]['today'])
+        triggered, old_v, latest_v, had_history = had_no_increase_in(hist, now, feed_window, local_hour=local_hour)
+        if triggered:
+            alerts.append({
+                'rule_id': 'DAT-01', 'metric': f'Data freshness ({feed})', 'level': level,
+                'entity': label, 'project_id': pid, 'value': latest_v, 'baseline': old_v,
+                'severity': 'CRITICAL',
+                'note': f'{feed} feed stale: no increase in >= {feed_window:.1f}h (was {old_v}, still {latest_v})',
+            })
 
 
 def run_once():
@@ -343,54 +475,21 @@ def run_once():
     for pid, label in PROJECTS.items():
         t = totals[pid]
         # This project's own local hour, for the grace period only (added 2026-11-17) - see
-        # PROJECT_TIMEZONES/local_hour_for() above. Computed once per project per run, reused
-        # by every rule below so all of this project's checks agree on "is it night there".
+        # PROJECT_TIMEZONES/local_hour_for() above. Computed for every project (including 4,
+        # where it's Athens-unconverted) since the LP-level block below always uses it; project
+        # 4's own project-level rules use their own per-country local_hour instead, below.
         local_hour = local_hour_for(now, PROJECT_TIMEZONES.get(pid))
 
-        if t['clicks']['yesterday'] >= CLK_01_ELIGIBLE_CLICKS_YDAY:
-            clk_window = dynamic_window(CLK_01_WINDOW_H, t['clicks']['yesterday'])
-            a = check_project_metric(state, now, pid, label, 'clicks', t['clicks']['today'],
-                                      clk_window, 'CLK-01', 'Clicks', local_hour=local_hour)
-            if a: alerts.append(a)
-
-        if t['registrations']['yesterday'] >= REG_01_ELIGIBLE_REGS_YDAY:
-            reg_window = REG_01_WINDOW_HIGH_H if t['registrations']['yesterday'] < REG_01_LOW_FLOOR_YDAY else REG_01_WINDOW_LOW_H
-            reg_window = dynamic_window(reg_window, t['registrations']['yesterday'])
-            a = check_project_metric(state, now, pid, label, 'registrations', t['registrations']['today'],
-                                      reg_window, 'REG-01', 'Registrations',
-                                      f" (window={reg_window}h, yesterday's regs={t['registrations']['yesterday']:.0f})",
-                                      local_hour=local_hour)
-            if a: alerts.append(a)
-
-        if t['ftds']['yesterday'] >= FTD_01_ELIGIBLE_FTDS_YDAY:
-            ftd_window = FTD_01_WINDOW_HIGH_H if t['ftds']['yesterday'] < FTD_01_LOW_FLOOR_YDAY else FTD_01_WINDOW_LOW_H
-            ftd_window = dynamic_window(ftd_window, t['ftds']['yesterday'])
-            a = check_project_metric(state, now, pid, label, 'ftds', t['ftds']['today'],
-                                      ftd_window, 'FTD-01', 'FTDs',
-                                      f" (window={ftd_window}h, yesterday's FTDs={t['ftds']['yesterday']:.0f})",
-                                      local_hour=local_hour)
-            if a: alerts.append(a)
-
-        if t['deposits']['yesterday'] >= DEP_01_ELIGIBLE_DEPOSITS_YDAY:
-            dep_window = dynamic_window(DEP_01_WINDOW_H, t['deposits']['yesterday'])
-            a = check_project_metric(state, now, pid, label, 'deposits', t['deposits']['today'],
-                                      dep_window, 'DEP-01', 'Deposit events', local_hour=local_hour)
-            if a: alerts.append(a)
-
-        for feed in DAT_01_FEEDS:
-            if t[feed]['yesterday'] < DAT_01_FEED_FLOORS[feed]:
-                continue  # below this feed's own volume floor - "flat" is normal, not a signal
-            feed_window = dynamic_window(DAT_01_WINDOW_H, t[feed]['yesterday'])
-            key = f'{pid}|{feed}|Project'
-            hist = append_snapshot(state, key, now, t[feed]['today'])
-            triggered, old_v, latest_v, had_history = had_no_increase_in(hist, now, feed_window, local_hour=local_hour)
-            if triggered:
-                alerts.append({
-                    'rule_id': 'DAT-01', 'metric': f'Data freshness ({feed})', 'level': 'Project',
-                    'entity': label, 'project_id': pid, 'value': latest_v, 'baseline': old_v,
-                    'severity': 'CRITICAL',
-                    'note': f'{feed} feed stale: no increase in >= {feed_window:.1f}h (was {old_v}, still {latest_v})',
-                })
+        if pid == 4:
+            # Project 4 (Brazino777.io): one country's worth of eligibility/window/grace per
+            # country, not one project-wide average - see P4_COUNTRIES' own comment above.
+            p4_totals = fetch_p4_country_totals(engine, today, yesterday)
+            for country in P4_COUNTRIES:
+                c_local_hour = local_hour_for(now, P4_COUNTRY_TIMEZONES[country])
+                run_project_level_rules(state, now, pid, f'{label} ({country})', p4_totals[country],
+                                         c_local_hour, alerts, entity_key=f'Project|{country}', level='Country')
+        else:
+            run_project_level_rules(state, now, pid, label, t, local_hour, alerts)
 
         try:
             today_c, today_r, yday_c, yday_r = fetch_lp_totals(engine, pid, today, yesterday)

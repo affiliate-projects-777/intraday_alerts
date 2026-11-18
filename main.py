@@ -706,16 +706,27 @@ def send_am_chat_messages(alerts, now):
 def format_hourly_message(alerts, now):
     """One message per hourly run, grouped by project - resent every hour an issue stays open
     (user's own choice, 2026-11-16: no new-vs-still-open distinction here, unlike the daily
-    check's NEW/ESCALATION/REMINDER - every qualifying hour gets its own send)."""
+    check's NEW/ESCALATION/REMINDER - every qualifying hour gets its own send).
+
+    FIX (2026-11-18, user: "split the io per country and show me the alerts for each country as
+    if they were different projects"): a Country-level row (project 4's own per-country
+    CLK-01/REG-01/FTD-01/DEP-01/DAT-01, see run_project_level_rules()'s own `level='Country'`)
+    now gets its OWN top-level group, keyed by its already-distinct entity label
+    ("Brazino777.io (AR)") exactly like any other project's group - not nested one level down
+    under a shared "Brazino777.io" header with that same label repeated a second time inside the
+    alert line's own parenthetical, which is what grouping by project_id alone produced before.
+    LP-level rows (CLK-17/REG-17) are unaffected - project 4's landing pages still have no
+    country field (see run_once()'s own comment), so they still group under plain
+    "Brazino777.io"."""
     import html as _html
-    by_project = {}
+    groups = {}  # group_label -> list[alert]
     for a in alerts:
-        by_project.setdefault(a['project_id'], []).append(a)
+        label = a['entity'] if a.get('level') == 'Country' else PROJECTS.get(a['project_id'], str(a['project_id']))
+        groups.setdefault(label, []).append(a)
     lines = [f"<b>Hourly check — {now.strftime('%Y-%m-%d %H:%M')}</b>"]
-    for pid in sorted(by_project, key=lambda p: PROJECTS.get(p, str(p))):
-        label = PROJECTS.get(pid, str(pid))
+    for label in sorted(groups):
         lines.append(f"\n<b>{_html.escape(label)}</b>")
-        for a in sorted(by_project[pid], key=lambda x: (x['severity'] != 'CRITICAL', x['rule_id'])):
+        for a in sorted(groups[label], key=lambda x: (x['severity'] != 'CRITICAL', x['rule_id'])):
             entity = a['entity']
             entity_part = f" ({_html.escape(entity)})" if entity != label else ""
             lines.append(f"[{a['severity']}] {a['rule_id']} - {_html.escape(a['metric'])}{entity_part}\n"

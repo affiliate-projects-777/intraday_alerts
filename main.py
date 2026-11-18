@@ -717,8 +717,58 @@ def format_hourly_message(alerts, now):
     alert line's own parenthetical, which is what grouping by project_id alone produced before.
     LP-level rows (CLK-17/REG-17) are unaffected - project 4's landing pages still have no
     country field (see run_once()'s own comment), so they still group under plain
-    "Brazino777.io"."""
-    import html as _html
+    "Brazino777.io".
+
+    FIX (2026-11-18, user: "the language in the hourly alerts should match the daily, now it is
+    a bit robotic, we do not need DAT-01" - approved after a before/after sample was shown):
+    lines no longer lead with the raw rule_id (daily's own render never shows one either, per
+    RULES.md's "Telegram message format" section) - _humanize() turns each rule's already-
+    computed `note` text into one plain sentence, same "SEVERITY - description" shape daily
+    uses, CRITICAL bolded the same way. Reuses the exact numbers already in `note`/`metric`
+    rather than re-deriving them from the raw alert dict, so this is a rendering change only -
+    no detection logic touched."""
+    import html as _html, re as _re
+
+    FEED_LABEL = {'clicks': 'Clicks feed', 'registrations': 'Registrations feed',
+                  'ftds': 'FTD feed', 'deposits': 'Deposits feed'}
+
+    def _num(s):
+        try:
+            return f"{float(s.replace(',', '')):,.0f}"
+        except ValueError:
+            return s
+
+    def _humanize(a):
+        rid, note, metric, entity = a['rule_id'], a['note'], a['metric'], a['entity']
+        if rid == 'DAT-01':
+            m = _re.match(r'^(\w+) feed stale: no increase in >= ([\d.]+)h \(was ([\d.]+), still ([\d.]+)\)$', note)
+            if m:
+                feed, window, _old, latest = m.groups()
+                label = FEED_LABEL.get(feed, f'{feed} feed')
+                return f"{label} stopped updating: still showing {_num(latest)}, no change in over {float(window):.0f}h"
+        elif rid == 'REG-17':
+            m = _re.match(r'^([\d,]+) clicks in the last ([\d.]+)h, 0 registrations(.*)$', note)
+            if m:
+                clicks, window, extra = m.groups()
+                return (f"Registrations on {entity}: {_num(clicks)} clicks in the last {float(window):.0f}h but "
+                         f"0 sign-ups (likely a tracking break){extra}")
+        elif rid == 'CLK-17':
+            m = _re.match(r'^LP had ([\d,.]+) clicks yesterday \(eligible\); no increase in >= ([\d.]+)h(.*)$', note)
+            if m:
+                yday, window, extra = m.groups()
+                return (f"Clicks on {entity}: flat for over {float(window):.0f}h "
+                         f"(had {_num(yday)} clicks yesterday, so this page is normally active){extra}")
+        else:
+            m = _re.match(r'^no increase in >= ([\d.]+)h \(was [\d.]+, still ([\d.]+)\)(.*)$', note)
+            if m:
+                window, latest, extra = m.groups()
+                ctx = ''
+                extra_m = _re.search(r"yesterday'?s (\w+)=([\d.]+)", extra)
+                if extra_m:
+                    ctx = f" (yesterday this project had {_num(extra_m.group(2))} {extra_m.group(1)} by this time)"
+                return f"{metric}: flat at {_num(latest)} for over {float(window):.0f}h{ctx}"
+        return f"{metric}: {note}"  # fallback, unrecognized note shape - show it plain rather than hide it
+
     groups = {}  # group_label -> list[alert]
     for a in alerts:
         label = a['entity'] if a.get('level') == 'Country' else PROJECTS.get(a['project_id'], str(a['project_id']))
@@ -727,10 +777,8 @@ def format_hourly_message(alerts, now):
     for label in sorted(groups):
         lines.append(f"\n<b>{_html.escape(label)}</b>")
         for a in sorted(groups[label], key=lambda x: (x['severity'] != 'CRITICAL', x['rule_id'])):
-            entity = a['entity']
-            entity_part = f" ({_html.escape(entity)})" if entity != label else ""
-            lines.append(f"[{a['severity']}] {a['rule_id']} - {_html.escape(a['metric'])}{entity_part}\n"
-                          f"    {_html.escape(a['note'])}")
+            sev = f"<b>{a['severity']}</b>" if a['severity'] == 'CRITICAL' else a['severity']
+            lines.append(f"{sev} - {_html.escape(_humanize(a))}")
     return "\n".join(lines)
 
 

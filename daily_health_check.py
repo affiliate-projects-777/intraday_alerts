@@ -567,8 +567,9 @@ def _dominant_partner_note(row):
 
 def _lag1_note(row):
     """FIX (2026-11-11, AUDIT_HISTORY.md finding #122): health_check_engine.py's
-    correlate_lag1() links an ENG-02 engagement spike to a cash-out-side alert (WDR-02/NGR-01/
-    FGR-01/GGR-03) firing for the same project exactly one day later - two alerts that used to
+    correlate_lag1() links an ENG-02 engagement spike to a withdrawal-spike alert (WDR-02;
+    narrowed from four rules on 2026-11-24, see LAG1_FOLLOWUP_RULES) firing for the same project
+    exactly one day later - two alerts that used to
     read as fully unrelated.
 
     FIX (2026-11-11, user feedback): two problems with the original wording. (1) It named the

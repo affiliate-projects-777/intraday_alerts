@@ -1860,7 +1860,13 @@ def correlate_formula_pairs(res_df):
 # TIMING lines up (`prior_day_rule_ids`) - the note for that case has to say "possible", not
 # "is", and should say so explicitly rather than asserting a cause with no evidence behind it.
 LAG1_TRIGGER_RULE = 'ENG-02'
-LAG1_FOLLOWUP_RULES = ['WDR-02', 'NGR-01', 'FGR-01', 'GGR-03']
+# 2026-11-24: narrowed to WDR-02 only, at the user's request, after a real-data check (5 projects x
+# 121 days, 14 ENG-02 days / 12 episodes): WDR-02 was the only follow-up above chance (2 of 14 vs
+# ~3% base rate; it is also the only one with a real observed case, project 6 2026-11-09/10).
+# NGR-01 fires on ~32% of ALL days (below chance after ENG-02), FGR-01 is a persistent 7-day sum
+# (as common the same day as the day after), GGR-03 never followed ENG-02 and a GGR rise is not a
+# cash-out. Overall 9 links vs ~7 expected by chance before this change.
+LAG1_FOLLOWUP_RULES = ['WDR-02']
 
 
 def correlate_lag1(res_df):

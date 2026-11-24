@@ -22,7 +22,7 @@ from alert_types import (
     EscalationReason, HistoryFlag, IncidentLine, Lifecycle, Metric, PartnerRef,
     Scope, Severity, StreakData, BreadthData, BreadthItem, DeviationData, Unit,
     AttributionNote, CustomerConcentrationNote, SharedAssetNote, HistoryNote,
-    TopItemsNote, DeclaredPairNote, LagNote, PLATFORM, UNASSIGNED,
+    TopItemsNote, DeclaredPairNote, FormulaPairNote, LagNote, PLATFORM, UNASSIGNED,
 )
 
 # ================================================================= per-rule_id dispatch tables
@@ -279,6 +279,16 @@ def _notes_for_row(row, partner_names: Dict[int, str]) -> List:
         labels = tuple(dict.fromkeys(_rule_id_label(r) for r in rids))
         if labels:
             notes.append(DeclaredPairNote(linked_labels=labels))
+
+    formula_rules = row.get('formula_linked_rule_ids')
+    if formula_rules and not pd.isna(formula_rules):
+        f_rids = [r.strip() for r in str(formula_rules).split(',') if r.strip()]
+        f_labels = tuple(dict.fromkeys(_rule_id_label(r) for r in f_rids))
+        if f_labels:
+            notes.append(FormulaPairNote(
+                metric_label=_rule_id_label(str(row.get('rule_id'))),
+                linked_labels=f_labels,
+                small_denominator=bool(row.get('formula_small_denominator'))))
 
     prior_rule = row.get('prior_day_rule_ids')
     if prior_rule and not pd.isna(prior_rule):

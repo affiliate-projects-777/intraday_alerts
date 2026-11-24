@@ -379,7 +379,7 @@ def assemble_notes(row, skip_correlation=False):
     THIS specific case, because the user gave direct, explicit instruction to stop describing
     things that aren't independently visible, not because the old default was wrong in general."""
     notes = [] if skip_correlation else [_correlation_note(row)]
-    notes.extend([attribution_tag(row), _solo_whale_note(row), _entity_correlation_note(row),
+    notes.extend([attribution_tag(row), _solo_whale_note(row), _entity_correlation_note(row), _formula_correlation_note(row),
                   _top3_whale_note(row), _lag1_note(row),
                   _ratio_hint_note(row), _dominant_partner_note(row), _note_highlight(row)])
     return [n for n in notes if n]
@@ -468,6 +468,23 @@ def _entity_correlation_note(row):
         return ""
     visible_text = ', '.join(dict.fromkeys(_rule_id_label(t) for t in visible))
     return f"Same cause as {visible_text}."
+
+
+def _formula_correlation_note(row):
+    """2026-11-24: health_check_engine.py's correlate_formula_pairs() links a Project-level NGR-01 /
+    NGG-01 alert to the same-day alerts it is arithmetically built from (NGR = GGR - bonuses -
+    admin fees; NGG = NGR / GGR). Linked rows are non-INFO only, so they are always visible."""
+    linked = row.get('formula_linked_rule_ids')
+    if not linked or pd_isna(linked):
+        return ""
+    tokens = [t.strip() for t in str(linked).split(',') if t.strip()]
+    if not tokens:
+        return ""
+    labels = ', '.join(dict.fromkeys(_rule_id_label(t) for t in tokens))
+    text = f"Follows from {labels}: {_rule_id_label(str(row.get('rule_id')))} is built from them."
+    if row.get('formula_small_denominator') is True:
+        text += " GGR is near zero, so this ratio may be exaggerated by a small base."
+    return text
 
 
 def _note_highlight(row):
@@ -1629,6 +1646,7 @@ def main():
                         'prior_day_rule_ids', 'prior_day_metric', 'prior_day_shared_partner',
                         'ratio_hint_partner', 'ratio_hint_share', 'ratio_hint_confirmed',
                         'dominant_partner', 'dominant_partner_share', 'entity_linked_rule_ids',
+                        'formula_linked_rule_ids', 'formula_small_denominator',
                         'partner_id', 'attribution', 'traffic_type']
                 sheet_today = f'P{pid}_today'[:31]
                 todays_out = todays[cols] if not todays.empty else pd.DataFrame(columns=cols)

@@ -75,7 +75,7 @@ from alert_types import (
     Alert, AlertType, BaselineType, Confidence, DimensionType, EscalationReason,
     HistoryFlag, Lifecycle, Scope, Severity, Unit,
     AttributionNote, CustomerConcentrationNote, SharedAssetNote, EscalationNote,
-    HistoryNote, TopItemsNote, DeclaredPairNote, LagNote, PLATFORM, UNASSIGNED,
+    HistoryNote, TopItemsNote, DeclaredPairNote, FormulaPairNote, LagNote, PLATFORM, UNASSIGNED,
 )
 
 MINUS = '−'
@@ -302,7 +302,7 @@ _ESCALATION_REASON_TEXT = {
 
 def _note_sort_key(note) -> int:
     order = [EscalationNote, SharedAssetNote, HistoryNote, AttributionNote,
-             CustomerConcentrationNote, DeclaredPairNote, LagNote, TopItemsNote]
+             CustomerConcentrationNote, DeclaredPairNote, FormulaPairNote, LagNote, TopItemsNote]
     for i, cls in enumerate(order):
         if isinstance(note, cls):
             return i
@@ -373,6 +373,13 @@ def render_declared_pair_note(note: DeclaredPairNote) -> str:
     return f"    Also linked to {_list_prose(note.linked_labels)}, same partner, same day."
 
 
+def render_formula_pair_note(note: FormulaPairNote) -> str:
+    text = f"    Follows from {_list_prose(note.linked_labels)}: {note.metric_label} is built from them."
+    if note.small_denominator:
+        text += " GGR is near zero, so this ratio may be exaggerated by a small base."
+    return text
+
+
 def render_lag_note(note: LagNote) -> str:
     trigger = _metric_prose(note.trigger_label)
     if note.shared_partner is None:
@@ -396,6 +403,8 @@ def render_note(note, metric_label: Optional[str] = None) -> str:
         return render_top_items_note(note)
     if isinstance(note, DeclaredPairNote):
         return render_declared_pair_note(note)
+    if isinstance(note, FormulaPairNote):
+        return render_formula_pair_note(note)
     if isinstance(note, LagNote):
         return render_lag_note(note)
     raise ValueError(f"unknown note type {type(note)!r}")

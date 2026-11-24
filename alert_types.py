@@ -197,6 +197,16 @@ class DeclaredPairNote:
 
 
 @dataclass(frozen=True)
+class FormulaPairNote:
+    """A Project-level NGR drop or NGR/GGR ratio drop that the engine's FORMULA_COUPLING links to
+    same-day alerts it is arithmetically built from (NGR = GGR - bonuses - admin fees; NGG = NGR /
+    GGR). `small_denominator` is set only for the ratio rule when the GGR baseline is near zero."""
+    metric_label: str  # the derived metric's own label, e.g. "NGR" or "NGR/GGR ratio"
+    linked_labels: tuple  # tuple[str, ...] - plain-language labels of the explaining alerts, deduped
+    small_denominator: bool = False
+
+
+@dataclass(frozen=True)
 class LagNote:
     """A one-day-lag relationship (engine's LAG1_TRIGGER_RULE/LAG1_FOLLOWUP_RULES) - yesterday's
     trigger rule fired at Project level, same project. `shared_partner` is set only when a real

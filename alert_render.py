@@ -374,7 +374,8 @@ def render_declared_pair_note(note: DeclaredPairNote) -> str:
 
 
 def render_formula_pair_note(note: FormulaPairNote) -> str:
-    text = f"    Follows from {_list_prose(note.linked_labels)}: {note.metric_label} is built from them."
+    pron = "it" if len(note.linked_labels) == 1 else "them"
+    text = f"    Follows from {_list_prose(note.linked_labels)}: {note.metric_label} is built from {pron}."
     if note.small_denominator:
         text += " GGR is near zero, so this ratio may be exaggerated by a small base."
     return text

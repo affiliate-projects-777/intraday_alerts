@@ -480,8 +480,9 @@ def _formula_correlation_note(row):
     tokens = [t.strip() for t in str(linked).split(',') if t.strip()]
     if not tokens:
         return ""
-    labels = ', '.join(dict.fromkeys(_rule_id_label(t) for t in tokens))
-    text = f"Follows from {labels}: {_rule_id_label(str(row.get('rule_id')))} is built from them."
+    uniq = list(dict.fromkeys(_rule_id_label(t) for t in tokens))
+    pron = "it" if len(uniq) == 1 else "them"
+    text = f"Follows from {', '.join(uniq)}: {_rule_id_label(str(row.get('rule_id')))} is built from {pron}."
     if row.get('formula_small_denominator') is True:
         text += " GGR is near zero, so this ratio may be exaggerated by a small base."
     return text

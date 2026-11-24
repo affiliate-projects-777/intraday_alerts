@@ -471,9 +471,8 @@ def _entity_correlation_note(row):
 
 
 def _formula_correlation_note(row):
-    """2026-11-24: health_check_engine.py's correlate_formula_pairs() links a Project-level NGR-01 /
-    NGG-01 alert to the same-day alerts it is arithmetically built from (NGR = GGR - bonuses -
-    admin fees; NGG = NGR / GGR). Linked rows are non-INFO only, so they are always visible."""
+    """2026-11-24: health_check_engine.py's correlate_formula_pairs() links a Project-level NGR-01
+    alert to the same-day alerts it is arithmetically built from (NGR = GGR - bonuses - admin fees). Linked rows are non-INFO only, so they are always visible."""
     linked = row.get('formula_linked_rule_ids')
     if not linked or pd_isna(linked):
         return ""
@@ -483,8 +482,6 @@ def _formula_correlation_note(row):
     uniq = list(dict.fromkeys(_rule_id_label(t) for t in tokens))
     pron = "it" if len(uniq) == 1 else "them"
     text = f"Follows from {', '.join(uniq)}: {_rule_id_label(str(row.get('rule_id')))} is built from {pron}."
-    if row.get('formula_small_denominator') is True:
-        text += " GGR is near zero, so this ratio may be exaggerated by a small base."
     return text
 
 
@@ -1647,7 +1644,7 @@ def main():
                         'prior_day_rule_ids', 'prior_day_metric', 'prior_day_shared_partner',
                         'ratio_hint_partner', 'ratio_hint_share', 'ratio_hint_confirmed',
                         'dominant_partner', 'dominant_partner_share', 'entity_linked_rule_ids',
-                        'formula_linked_rule_ids', 'formula_small_denominator',
+                        'formula_linked_rule_ids',
                         'partner_id', 'attribution', 'traffic_type']
                 sheet_today = f'P{pid}_today'[:31]
                 todays_out = todays[cols] if not todays.empty else pd.DataFrame(columns=cols)

@@ -1799,28 +1799,22 @@ def correlate_entity_pairs(res_df):
 # arithmetically built from that one", true whether or not this window happened to show it:
 #   NGR = GGR - bonuses - admin fees (- chargebacks, which no rule monitors), so an NGR-01 drop
 #         is explained by a same-day GGR move, a bonus rise (BON-02) or an admin-fee rise (ADM-03);
-#   NGG = NGR / GGR, so an NGG-01 drop is explained by a same-day GGR move.
+# (NGG-01, the NGR/GGR ratio drop <- GGR move, was tried and REMOVED 2026-11-24 at the user's
+# request: "Follows from GGR: NGR/GGR ratio is built from it" told the AM nothing actionable.)
 # One-directional on purpose: only the DERIVED metric's alert (the key) is annotated, since that
 # is the one an AM needs explained. Project level, annotate-only (never suppresses, never touches
 # severity), and only links alerts that are themselves actionable (severity != INFO) so the note
 # never points at something the AM cannot see.
 FORMULA_COUPLING = {
     'NGR-01': ['GGR-01', 'GGR-02', 'GGR-03', 'BON-02', 'ADM-03'],
-    'NGG-01': ['GGR-01', 'GGR-02', 'GGR-03'],
 }
-# NGG-01 only: if the matched GGR alert's own baseline is below this ($), NGR/GGR is dividing by
-# almost nothing and the ratio move may be amplified by the small denominator (same $1.0 guard
-# pattern as correlate_alerts()'s own near-zero-total check).
-FORMULA_NEAR_ZERO_GGR = 1.0
 
 
 def correlate_formula_pairs(res_df):
-    """Annotate Project-level NGR-01/NGG-01 alerts with the same-day alerts that explain them by
-    formula (FORMULA_COUPLING). Adds `formula_linked_rule_ids` (comma-joined rule_ids) and
-    `formula_small_denominator` (True when an NGG-01 link rests on a near-zero GGR baseline)."""
+    """Annotate Project-level NGR-01 alerts with the same-day alerts that explain them by
+    formula (FORMULA_COUPLING). Adds `formula_linked_rule_ids` (comma-joined rule_ids)."""
     res_df = res_df.copy()
     res_df['formula_linked_rule_ids'] = ''
-    res_df['formula_small_denominator'] = False
     proj = res_df[(res_df['level'] == 'Project') & (res_df['severity'] != 'INFO')]
     if proj.empty:
         return res_df
@@ -1834,11 +1828,6 @@ def correlate_formula_pairs(res_df):
                 continue
             idx = (res_df['level'] == 'Project') & (res_df['date'] == d) & (res_df['rule_id'] == rid)
             res_df.loc[idx, 'formula_linked_rule_ids'] = ', '.join(matched)
-            if rid == 'NGG-01':
-                ggr_rows = grp[grp['rule_id'].isin([m for m in matched if m.startswith('GGR')])]
-                bases = pd.to_numeric(ggr_rows['baseline'], errors='coerce').abs()
-                if bases.notna().any() and bases.min() < FORMULA_NEAR_ZERO_GGR:
-                    res_df.loc[idx, 'formula_small_denominator'] = True
     return res_df
 
 
@@ -2083,7 +2072,7 @@ def apply_correlation(res_df, ps, eng):
     """Runs correlate_alerts() (customer-identity + top-3-combined-share, Project level), then
     annotate_project_dominant_partner() (partner-id hierarchy share, Project level), then
     correlate_entity_pairs() (declared static pairs, Partner level), then
-    correlate_formula_pairs() (NGR-01/NGG-01 explained by formula, Project level), then
+    correlate_formula_pairs() (NGR-01 explained by formula, Project level), then
     annotate_ratio_numerator_hint() (soft numerator-contributor hint for ratio-family rules,
     Project level) and finally correlate_lag1() (one-day-lag ENG-02 -> cash-out rules, Project
     level) - findings #121-123, 2026-11-11. The ratio-hint step MUST run before correlate_lag1():

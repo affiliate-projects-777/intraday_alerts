@@ -287,8 +287,7 @@ def _notes_for_row(row, partner_names: Dict[int, str]) -> List:
         if f_labels:
             notes.append(FormulaPairNote(
                 metric_label=_rule_id_label(str(row.get('rule_id'))),
-                linked_labels=f_labels,
-                small_denominator=bool(row.get('formula_small_denominator'))))
+                linked_labels=f_labels))
 
     prior_rule = row.get('prior_day_rule_ids')
     if prior_rule and not pd.isna(prior_rule):

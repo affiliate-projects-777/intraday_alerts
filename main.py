@@ -47,6 +47,9 @@ from datetime import datetime, timedelta
 import pandas as pd
 from sqlalchemy import create_engine, text
 
+from hourly_logic import (had_no_increase_in, build_profile, expected_events, choose_window,
+                          MIN_EXPECTED)
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
@@ -302,30 +305,7 @@ def append_result(record):
 
 
 # ------------------------------------------------------------- pure check logic
-# (identical to intraday_check.py's own had_no_increase_in() - see that file for the
-# full reasoning on the same-calendar-day guard)
-def had_no_increase_in(history, as_of, hours, grace_until_hour=GRACE_UNTIL_HOUR, local_hour=None):
-    today = as_of.date()
-    same_day = sorted((t, v) for t, v in history if t.date() == today and t <= as_of)
-    if not same_day:
-        return False, None, None, False
-    latest_t, latest_v = same_day[-1]
-    cutoff = as_of - pd.Timedelta(hours=float(hours))
-    candidates = [(t, v) for t, v in same_day if t <= cutoff]
-    if not candidates:
-        return False, None, latest_v, False
-    old_t, old_v = max(candidates, key=lambda tv: tv[0])
-    check_hour = as_of.hour if local_hour is None else local_hour
-    if old_v == 0 and grace_until_hour is not None and check_hour < grace_until_hour:
-        # Nothing has happened yet today as of the comparison point - "hasn't started" and
-        # "dead" look identical until enough of the day has passed, so don't fire yet. Once
-        # old_v > 0 (something ticked, then went flat) this grace no longer applies, at any
-        # hour - see GRACE_UNTIL_HOUR's own comment for the real evidence behind this.
-        # check_hour (added 2026-11-17): the project's own local hour, not necessarily
-        # as_of.hour (this container's Athens server time) - see PROJECT_TIMEZONES/
-        # local_hour_for() above.
-        return False, old_v, latest_v, True
-    return (latest_v <= old_v), old_v, latest_v, True
+# had_no_increase_in() moved to hourly_logic.py 2026-11-26 (reset-aware - see its docstring).
 
 
 # ------------------------------------------------------------- data pull (direct SQL,
@@ -432,72 +412,107 @@ def lp_dominant_partner_am(engine, landing_id, today, metric_col):
 
 
 # ------------------------------------------------------------- rule evaluators
-def check_project_metric(state, now, pid, label, metric, value_today, window_hours, rule_id, metric_label,
-                          note_extra='', local_hour=None, entity_key='Project', level='Project'):
-    key = f'{pid}|{metric}|{entity_key}'
-    hist = append_snapshot(state, key, now, value_today)
-    triggered, old_v, latest_v, had_history = had_no_increase_in(hist, now, window_hours, local_hour=local_hour)
-    if not triggered:
-        return None
+# Per-project hour (Athens, i.e. this container's clock) before which NO stall checks run for that
+# project, added 2026-11-26: Brazino777.ar's cumulative counters are restated by a batch around
+# 12:00 Athens (11-26: registrations 213 at 11:00 -> 36 at 12:00; "yesterday" 39 -> 42 -> 55 -> 44),
+# so both today's partial counts and the yesterday baseline (floors, expected-events window) are
+# unreliable before it. Only project 6 showed counter drops in 13 days of history; add others here
+# if they do. Snapshots are still recorded before this hour so history is continuous.
+PROJECT_SETTLE_HOUR_ATHENS = {6: 12}
+
+# feed -> the rule that already watches that exact feed. DAT-01 ("data freshness") tested the SAME
+# series with the same logic, so one stall produced two alerts (132 of 276 alert-hours in the
+# 11-18..11-26 replay). It now fires only when the feed's own rule did NOT fire for the entity.
+FEED_OWN_RULE = {'clicks': 'CLK-01', 'registrations': 'REG-01', 'ftds': 'FTD-01', 'deposits': 'DEP-01'}
+
+
+def _stall_alert(rule_id, metric_label, level, label, pid, old_v, latest_v, window, note_extra=''):
     return {
         'rule_id': rule_id, 'metric': metric_label, 'level': level, 'entity': label,
         'project_id': pid, 'value': latest_v, 'baseline': old_v, 'severity': 'CRITICAL',
-        'note': f'no increase in >= {window_hours}h (was {old_v}, still {latest_v})' + note_extra,
+        'note': f'no increase in >= {window:g}h (was {old_v}, still {latest_v})' + note_extra,
     }
 
 
-def run_project_level_rules(state, now, pid, label, t, local_hour, alerts, entity_key='Project', level='Project'):
+def run_project_level_rules(state, now, pid, label, t, local_hour, alerts, entity_key='Project',
+                            level='Project', profile=None, profile_entity=None):
     """Runs CLK-01/REG-01/FTD-01/DEP-01/DAT-01 for one project-level entity - a whole project for
     every project except 4, or (project 4 only, see P4_COUNTRIES) one of its countries, each with
     its own totals/local_hour/state history (`entity_key` keeps a country's snapshot history
     separate from every other country's and from a plain project's). Appends any fired alerts to
-    `alerts` in place."""
-    if t['clicks']['yesterday'] >= CLK_01_ELIGIBLE_CLICKS_YDAY:
-        clk_window = dynamic_window(CLK_01_WINDOW_H, t['clicks']['yesterday'])
-        a = check_project_metric(state, now, pid, label, 'clicks', t['clicks']['today'],
-                                  clk_window, 'CLK-01', 'Clicks', local_hour=local_hour,
-                                  entity_key=entity_key, level=level)
-        if a: alerts.append(a)
+    `alerts` in place.
 
-    if t['registrations']['yesterday'] >= REG_01_ELIGIBLE_REGS_YDAY:
-        reg_window = REG_01_WINDOW_HIGH_H if t['registrations']['yesterday'] < REG_01_LOW_FLOOR_YDAY else REG_01_WINDOW_LOW_H
-        reg_window = dynamic_window(reg_window, t['registrations']['yesterday'])
-        a = check_project_metric(state, now, pid, label, 'registrations', t['registrations']['today'],
-                                  reg_window, 'REG-01', 'Registrations',
-                                  f" (window={reg_window}h, yesterday's regs={t['registrations']['yesterday']:.0f})",
-                                  local_hour=local_hour, entity_key=entity_key, level=level)
-        if a: alerts.append(a)
+    2026-11-26 rework (see hourly_logic.py): reset-aware stall check (A), DAT-01 only when the
+    feed's own rule did not fire (B), expected-events window from the entity's own hourly profile
+    (C), no checks for restated projects before their settle hour (E)."""
+    profile = profile or {}
+    pe = profile_entity if profile_entity is not None else str(pid)
 
-    if t['ftds']['yesterday'] >= FTD_01_ELIGIBLE_FTDS_YDAY:
-        ftd_window = FTD_01_WINDOW_HIGH_H if t['ftds']['yesterday'] < FTD_01_LOW_FLOOR_YDAY else FTD_01_WINDOW_LOW_H
-        ftd_window = dynamic_window(ftd_window, t['ftds']['yesterday'])
-        a = check_project_metric(state, now, pid, label, 'ftds', t['ftds']['today'],
-                                  ftd_window, 'FTD-01', 'FTDs',
-                                  f" (window={ftd_window}h, yesterday's FTDs={t['ftds']['yesterday']:.0f})",
-                                  local_hour=local_hour, entity_key=entity_key, level=level)
-        if a: alerts.append(a)
+    # one snapshot per feed per run (the old code appended a second, duplicate point for DAT-01)
+    hists = {f: append_snapshot(state, f'{pid}|{f}|{entity_key}', now, t[f]['today']) for f in DAT_01_FEEDS}
+    if now.hour < PROJECT_SETTLE_HOUR_ATHENS.get(pid, 0):
+        return
 
-    if t['deposits']['yesterday'] >= DEP_01_ELIGIBLE_DEPOSITS_YDAY:
-        dep_window = dynamic_window(DEP_01_WINDOW_H, t['deposits']['yesterday'])
-        a = check_project_metric(state, now, pid, label, 'deposits', t['deposits']['today'],
-                                  dep_window, 'DEP-01', 'Deposit events', local_hour=local_hour,
-                                  entity_key=entity_key, level=level)
-        if a: alerts.append(a)
+    def window_for(feed, base):
+        y = t[feed]['yesterday']
+        entry = profile.get((pe, feed))
+        return choose_window(base, lambda w: expected_events(entry, now, w, y))
+
+    fired = set()
+
+    def check(feed, rule_id, metric_label, base, floor, note_fn=None):
+        y = t[feed]['yesterday']
+        if y < floor:
+            return
+        w = window_for(feed, base)
+        if w is None:
+            return  # too sparse for an hourly stall rule even at the 12h cap
+        stalled, old_v, latest_v, _ = had_no_increase_in(hists[feed], now, w, local_hour=local_hour)
+        if stalled:
+            extra = note_fn(w, y) if note_fn else ''
+            alerts.append(_stall_alert(rule_id, metric_label, level, label, pid, old_v, latest_v, w, extra))
+            fired.add(rule_id)
+
+    check('clicks', 'CLK-01', 'Clicks', CLK_01_WINDOW_H, CLK_01_ELIGIBLE_CLICKS_YDAY)
+    reg_base = lambda y: REG_01_WINDOW_HIGH_H if y < REG_01_LOW_FLOOR_YDAY else REG_01_WINDOW_LOW_H
+    check('registrations', 'REG-01', 'Registrations', reg_base(t['registrations']['yesterday']),
+          REG_01_ELIGIBLE_REGS_YDAY, lambda w, y: f" (window={w:g}h, yesterday's regs={y:.0f})")
+    ftd_base = FTD_01_WINDOW_HIGH_H if t['ftds']['yesterday'] < FTD_01_LOW_FLOOR_YDAY else FTD_01_WINDOW_LOW_H
+    check('ftds', 'FTD-01', 'FTDs', ftd_base, FTD_01_ELIGIBLE_FTDS_YDAY,
+          lambda w, y: f" (window={w:g}h, yesterday's FTDs={y:.0f})")
+    check('deposits', 'DEP-01', 'Deposit events', DEP_01_WINDOW_H, DEP_01_ELIGIBLE_DEPOSITS_YDAY)
 
     for feed in DAT_01_FEEDS:
+        if FEED_OWN_RULE[feed] in fired:
+            continue  # same series, already alerted by its own rule
         if t[feed]['yesterday'] < DAT_01_FEED_FLOORS[feed]:
-            continue  # below this feed's own volume floor - "flat" is normal, not a signal
-        feed_window = dynamic_window(DAT_01_WINDOW_H, t[feed]['yesterday'])
-        key = f'{pid}|{feed}|{entity_key}'
-        hist = append_snapshot(state, key, now, t[feed]['today'])
-        triggered, old_v, latest_v, had_history = had_no_increase_in(hist, now, feed_window, local_hour=local_hour)
-        if triggered:
+            continue
+        w = window_for(feed, DAT_01_WINDOW_H)
+        if w is None:
+            continue
+        stalled, old_v, latest_v, _ = had_no_increase_in(hists[feed], now, w, local_hour=local_hour)
+        if stalled:
             alerts.append({
                 'rule_id': 'DAT-01', 'metric': f'Data freshness ({feed})', 'level': level,
                 'entity': label, 'project_id': pid, 'value': latest_v, 'baseline': old_v,
                 'severity': 'CRITICAL',
-                'note': f'{feed} feed stale: no increase in >= {feed_window:.1f}h (was {old_v}, still {latest_v})',
+                'note': f'{feed} feed stale: no increase in >= {w:g}h (was {old_v}, still {latest_v})',
             })
+
+
+def load_profile(today):
+    """Per-entity hourly activity profile from the last PROFILE_DAYS completed days of
+    intraday_results.jsonl (see hourly_logic.build_profile). Any failure -> {} (callers fall back
+    to yesterday/24 per hour), never blocks the run."""
+    try:
+        if not os.path.exists(RESULTS_PATH):
+            return {}
+        with open(RESULTS_PATH, encoding='utf-8') as f:
+            records = [json.loads(l) for l in f if l.strip()]
+        return build_profile(records, today)
+    except Exception as e:
+        logging.error(f"profile load failed, using daily-average fallback: {e}")
+        return {}
 
 
 def run_once():
@@ -507,6 +522,7 @@ def run_once():
     state = load_state()
     alerts = []
     raw_snapshot = {}
+    profile = load_profile(today)
 
     engine = get_engine()
     totals = fetch_project_totals(engine, today, yesterday)
@@ -524,12 +540,14 @@ def run_once():
             # Project 4 (Brazino777.io): one country's worth of eligibility/window/grace per
             # country, not one project-wide average - see P4_COUNTRIES' own comment above.
             p4_totals = fetch_p4_country_totals(engine, today, yesterday)
+            raw_snapshot['p4_country_totals'] = p4_totals  # saved from 2026-11-26 so the hourly profile can learn it
             for country in P4_COUNTRIES:
                 c_local_hour = local_hour_for(now, P4_COUNTRY_TIMEZONES[country])
                 run_project_level_rules(state, now, pid, f'{label} ({country})', p4_totals[country],
-                                         c_local_hour, alerts, entity_key=f'Project|{country}', level='Country')
+                                         c_local_hour, alerts, entity_key=f'Project|{country}', level='Country',
+                                         profile=profile, profile_entity=f'4|{country}')
         else:
-            run_project_level_rules(state, now, pid, label, t, local_hour, alerts)
+            run_project_level_rules(state, now, pid, label, t, local_hour, alerts, profile=profile)
 
         try:
             today_c, today_r, yday_c, yday_r = fetch_lp_totals(engine, pid, today, yesterday)

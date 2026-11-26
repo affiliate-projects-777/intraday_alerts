@@ -135,3 +135,18 @@ was never actually matched by either pattern and ended up committed and pushed t
 `origin/main`. Not this repo's bug to fix, but worth knowing: every `.gitignore` written
 for this org's repos should get one pattern per line, checked, not assumed correct from
 how it reads.
+
+## Hourly noise fix (2026-11-26, branch `hourly-noise-fix-2026-11-26`)
+
+Replay of 13 days of real runs showed ~85% of hourly runs alerting, mostly noise. Logic now lives
+in `hourly_logic.py` (pure, tested in `tests/test_hourly_logic.py`):
+- **A** reset-aware stall check: a counter drop (Brazino777.ar is restated ~12:00 Athens) discards
+  earlier history; stall = no strict increase between consecutive snapshots in the window.
+- **B** DAT-01 fires only if the feed's own rule (CLK/REG/FTD/DEP-01) did not.
+- **C** window = shortest >= base (<=12h) with >=4.6 expected events from the entity's own hourly
+  profile (last 7 days of `intraday_results.jsonl`; falls back to yesterday/24 per hour with <3 days
+  of history, e.g. project 4 countries until `raw.p4_country_totals` accumulates). Too sparse at
+  12h -> no alert.
+- **E** `PROJECT_SETTLE_HOUR_ATHENS = {6: 12}`: no project-6 checks before 12:00 Athens.
+Replay (project-level, 11-18..11-26): 276 alert-hours -> 20. LP rules (CLK-17/REG-17) unchanged
+apart from A. Not changed: per-AM routing, Telegram format, "resend every qualifying hour" (D).

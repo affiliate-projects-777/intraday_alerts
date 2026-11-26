@@ -123,7 +123,10 @@ REG_01_ELIGIBLE_REGS_YDAY = 5
 # ranges ~2-5/day (seen both in this window), so 5 excludes it on its thinnest days and still
 # checks it, properly patience-scaled, on its fuller ones - not an invented number, the
 # project's own real range.
-FTD_01_ELIGIBLE_FTDS_YDAY = 5
+# Raised 5->20 on 2026-11-26 (user, after the hourly noise replay): Brazino777.ar (~10 FTDs/day, clustered
+# in the evening) fired FTD-01 for 8 straight hours on 11-25 with a legitimately flat daytime - at that
+# volume FTDs arrive in bursts, so "flat for 7h" is normal, not a stall. Also applies to DAT-01 (ftds).
+FTD_01_ELIGIBLE_FTDS_YDAY = 20
 DAT_01_FEED_FLOORS['ftds'] = FTD_01_ELIGIBLE_FTDS_YDAY
 
 # "Hasn't started yet" grace period, added 2026-11-17 (real production evidence): 3 separate

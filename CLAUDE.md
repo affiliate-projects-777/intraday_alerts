@@ -147,6 +147,10 @@ in `hourly_logic.py` (pure, tested in `tests/test_hourly_logic.py`):
   profile (last 7 days of `intraday_results.jsonl`; falls back to yesterday/24 per hour with <3 days
   of history, e.g. project 4 countries until `raw.p4_country_totals` accumulates). Too sparse at
   12h -> no alert.
-- **E** `PROJECT_SETTLE_HOUR_ATHENS = {6: 12}`: no project-6 checks before 12:00 Athens.
+- **E (removed 2026-11-26)** the project 6 "no checks before 12:00 Athens" special case is gone: every
+  project, Argentina included, is checked all day by the same rules (reset-aware A handles its restatement).
+- **LP rules (2026-11-26)** CLK-17/REG-17 now use the same profile-based window as the project rules
+  (`hourly_logic.lp_windows`, per-page profile from `raw.lp_totals`): first alert window and CRITICAL window each
+  start at their base (2h/6h, 4h/6h) and widen (<=12h) until 4.6 events are expected; too sparse -> no alert.
 Replay (project-level, 11-18..11-26): 276 alert-hours -> 20. LP rules (CLK-17/REG-17) unchanged
 apart from A. Not changed: per-AM routing, Telegram format, "resend every qualifying hour" (D).

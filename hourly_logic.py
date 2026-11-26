@@ -91,6 +91,11 @@ def build_profile(records, today, days=PROFILE_DAYS):
             for f in METRICS:
                 if f in m:
                     series[(f'4|{cc}', f)].append((t, float(m[f]['today'])))
+        # landing pages (added 2026-11-26): lp_totals[pid]['today_clicks'|'today_regs'] = {landing_id: value}
+        for pid, lp in raw.get('lp_totals', {}).items():
+            for src, f in (('today_clicks', 'clicks'), ('today_regs', 'registrations')):
+                for lid, v in (lp.get(src) or {}).items():
+                    series[(lp_entity(pid, lid), f)].append((t, float(v)))
     out = {}
     for key, pts in series.items():
         per_day = defaultdict(lambda: defaultdict(float))
@@ -110,6 +115,23 @@ def build_profile(records, today, days=PROFILE_DAYS):
                 hour_means[hr] = sum(vals) / len(vals)
         out[key] = (len(dates), hour_means)
     return out
+
+
+def lp_entity(pid, lid):
+    """Profile key of a landing page: 'lp|<project>|<landing id>' (ids arrive as 394, '394' or '394.0')."""
+    return f'lp|{int(float(pid))}|{int(float(lid))}'
+
+
+def lp_windows(profile_entry, now, yesterday_total, base_warn_h, base_crit_h):
+    """(warn_window, crit_window) in hours for a landing-page rule, same expected-events logic as the
+    project rules (see choose_window), each starting at its own base. None when the page is too sparse
+    for an hourly check even at the cap. crit is never shorter than warn."""
+    fn = lambda w: expected_events(profile_entry, now, w, yesterday_total)
+    warn = choose_window(base_warn_h, fn)
+    crit = choose_window(base_crit_h, fn)
+    if warn is None or crit is None:
+        return None
+    return warn, max(crit, warn)
 
 
 def _parse(s):

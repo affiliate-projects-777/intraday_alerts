@@ -48,7 +48,7 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 
 from hourly_logic import (had_no_increase_in, build_profile, expected_events, choose_window,
-                          MIN_EXPECTED)
+                          lp_entity, lp_windows, MIN_EXPECTED)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -415,14 +415,6 @@ def lp_dominant_partner_am(engine, landing_id, today, metric_col):
 
 
 # ------------------------------------------------------------- rule evaluators
-# Per-project hour (Athens, i.e. this container's clock) before which NO stall checks run for that
-# project, added 2026-11-26: Brazino777.ar's cumulative counters are restated by a batch around
-# 12:00 Athens (11-26: registrations 213 at 11:00 -> 36 at 12:00; "yesterday" 39 -> 42 -> 55 -> 44),
-# so both today's partial counts and the yesterday baseline (floors, expected-events window) are
-# unreliable before it. Only project 6 showed counter drops in 13 days of history; add others here
-# if they do. Snapshots are still recorded before this hour so history is continuous.
-PROJECT_SETTLE_HOUR_ATHENS = {6: 12}
-
 # feed -> the rule that already watches that exact feed. DAT-01 ("data freshness") tested the SAME
 # series with the same logic, so one stall produced two alerts (132 of 276 alert-hours in the
 # 11-18..11-26 replay). It now fires only when the feed's own rule did NOT fire for the entity.
@@ -447,14 +439,12 @@ def run_project_level_rules(state, now, pid, label, t, local_hour, alerts, entit
 
     2026-11-26 rework (see hourly_logic.py): reset-aware stall check (A), DAT-01 only when the
     feed's own rule did not fire (B), expected-events window from the entity's own hourly profile
-    (C), no checks for restated projects before their settle hour (E)."""
+    (C). Every project, Argentina included, is checked all day by the same rules (the E settle-hour special case was removed 2026-11-26)."""
     profile = profile or {}
     pe = profile_entity if profile_entity is not None else str(pid)
 
     # one snapshot per feed per run (the old code appended a second, duplicate point for DAT-01)
     hists = {f: append_snapshot(state, f'{pid}|{f}|{entity_key}', now, t[f]['today']) for f in DAT_01_FEEDS}
-    if now.hour < PROJECT_SETTLE_HOUR_ATHENS.get(pid, 0):
-        return
 
     def window_for(feed, base):
         y = t[feed]['yesterday']
@@ -576,9 +566,16 @@ def run_once():
                 # thousands/day. In practice this floor is already high enough that neither
                 # window moves for any LP currently eligible (24/100*1.5=0.36h, nowhere near
                 # either base) - consistent now, with headroom if the floor is ever lowered.
-                clk17_warn_window = dynamic_window(CLK_17_WARN_H, lp_yday_c)
-                clk17_crit_window = dynamic_window(CLK_17_CRIT_H, lp_yday_c)
-                trig_warn, old_v, latest_v, _ = had_no_increase_in(hist, now, clk17_warn_window, local_hour=local_hour)
+                # 2026-11-26: windows now come from this page's own hourly profile (same expected-events
+                # logic as the project rules, see hourly_logic.lp_windows) - quiet hours widen the window
+                # instead of alerting; a page too sparse even at the cap is not alerted on.
+                _w = lp_windows(profile.get((lp_entity(pid, lid), 'clicks')), now, lp_yday_c, CLK_17_WARN_H, CLK_17_CRIT_H)
+                if _w is None:
+                    clk17_warn_window = clk17_crit_window = None
+                    trig_warn, old_v, latest_v = False, None, None
+                else:
+                    clk17_warn_window, clk17_crit_window = _w
+                    trig_warn, old_v, latest_v, _ = had_no_increase_in(hist, now, clk17_warn_window, local_hour=local_hour)
                 if trig_warn:
                     trig_crit, _, _, _ = had_no_increase_in(hist, now, clk17_crit_window, local_hour=local_hour)
                     window_shown = clk17_crit_window if trig_crit else clk17_warn_window
@@ -608,15 +605,16 @@ def run_once():
                 # LP's own yesterday registrations (the metric REG-17 is actually waiting on),
                 # not its clicks. Floor (regs>=30) already keeps this moot in practice
                 # (24/30*1.5=1.2h, under both bases) - consistency/headroom, same as CLK-17.
-                reg17_warn_window = dynamic_window(REG_17_WARN_H, lp_yday_r)
-                reg17_crit_window = dynamic_window(REG_17_CRIT_H, lp_yday_r)
+                # 2026-11-26: profile-based windows, scaled by this page's REGISTRATIONS (the metric it waits on)
+                _w = lp_windows(profile.get((lp_entity(pid, lid), 'registrations')), now, lp_yday_r, REG_17_WARN_H, REG_17_CRIT_H)
+                reg17_warn_window, reg17_crit_window = _w if _w is not None else (None, None)
                 today_lw = now.date()
-                cutoff_warn = now - pd.Timedelta(hours=float(reg17_warn_window))
+                cutoff_warn = now - pd.Timedelta(hours=float(reg17_warn_window or 0))
                 c_same_day = sorted((t2, v) for t2, v in c_hist if t2.date() == today_lw and t2 <= now)
                 r_same_day = sorted((t2, v) for t2, v in r_hist if t2.date() == today_lw and t2 <= now)
                 c_before = [(t2, v) for t2, v in c_same_day if t2 <= cutoff_warn]
                 r_before = [(t2, v) for t2, v in r_same_day if t2 <= cutoff_warn]
-                if c_before and r_before:
+                if reg17_warn_window is not None and c_before and r_before:
                     c_delta = c_same_day[-1][1] - max(c_before, key=lambda tv: tv[0])[1]
                     r_delta = r_same_day[-1][1] - max(r_before, key=lambda tv: tv[0])[1]
                     if c_delta >= REG_17_MIN_CLICKS_IN_WINDOW and r_delta == 0:

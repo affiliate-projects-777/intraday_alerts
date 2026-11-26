@@ -104,8 +104,43 @@ def test_dat01_is_suppressed_when_own_rule_fires():
     rules = [x['rule_id'] for x in a]
     assert 'DEP-01' in rules and 'DAT-01' not in rules
 
-def test_settle_hour_blocks_project6_before_noon_only():
+def test_argentina_is_checked_all_day_like_every_other_project():
+    # the old special case skipped project 6 before 12:00 Athens; now a flat running total alerts at any hour
     flat = [(h, 50) for h in range(3, 11)]
-    assert _run(6, flat, yday=400, now_hour=10) == []
-    flat2 = [(h, 50) for h in range(3, 16)]
-    assert any(x['rule_id'] == 'DEP-01' for x in _run(6, flat2, yday=400, now_hour=15))
+    assert any(x['rule_id'] == 'DEP-01' for x in _run(6, flat, yday=400, now_hour=10))
+    assert not hasattr(main, 'PROJECT_SETTLE_HOUR_ATHENS')
+
+
+# ---- landing pages use the same profile-based windows
+from hourly_logic import lp_entity, lp_windows
+
+def test_lp_entity_normalises_ids():
+    assert lp_entity(4, 394) == lp_entity('4', '394.0') == 'lp|4|394'
+
+def _lp_rec(day, hour, clicks):
+    return {'run_at': f'2026-11-{day:02d}T{hour:02d}:00:00',
+            'raw': {'project_totals': {}, 'lp_totals': {'4': {'today_clicks': {'394': clicks}, 'today_regs': {'394': clicks // 10}}}}}
+
+def test_lp_profile_is_learned_and_quiet_night_widens_the_window():
+    recs = []
+    for day in (20, 21, 22):
+        v = 0
+        for hr in range(24):
+            v += 40 if 12 <= hr <= 20 else 2      # busy afternoon, very quiet night
+            recs.append(_lp_rec(day, hr, v))
+    prof = build_profile(recs, pd.Timestamp('2026-11-26').date())
+    entry = prof[('lp|4|394', 'clicks')]
+    assert entry[0] == 3 and entry[1][15] == 40 and entry[1][3] == 2
+    afternoon = lp_windows(entry, pd.Timestamp('2026-11-26 16:00'), 400, 2, 6)
+    night = lp_windows(entry, pd.Timestamp('2026-11-26 04:00'), 400, 2, 6)
+    assert afternoon == (2.0, 6.0)                  # plenty expected: bases kept
+    assert night[0] > afternoon[0]                  # 2 clicks/h at night: 4.6 expected needs 2.5h
+    assert night[1] >= night[0]
+
+def test_lp_too_sparse_returns_none_and_crit_never_below_warn():
+    now = pd.Timestamp('2026-11-26 10:00')
+    assert lp_windows(None, now, 8, 2, 6) is None            # 8/day = 0.33/h: even 12h expects only 4.0 < 4.6
+    # 20/day = 0.83/h: warn needs 5.5h but 5.5h only expects 4.58, so 6h for both
+    assert lp_windows(None, now, 20, 2, 6) == (6.0, 6.0)
+    warn, crit = lp_windows(None, now, 60, 4, 6)             # 2.5/h: warn 2h of base 4 stays 4, crit 6
+    assert (warn, crit) == (4.0, 6.0)

@@ -31,7 +31,7 @@ project. See PROJECT_TIMEZONES/local_hour_for().
 Project 4 (Brazino777.io) per-country split (added 2026-11-17, same day, user-confirmed country
 list: "io is Argentina, Bolivia, Chile, Colombia, Ecuador and Venezuela"): a single project-level
 check for project 4 would either average away each country's own real volume or apply the wrong
-one's timezone to the rest, so CLK-01/REG-01/FTD-01/DEP-01/DAT-01 run ONCE PER COUNTRY for
+one's timezone to the rest, so CLK-01/REG-01/FTD-01/DEP-01 run ONCE PER COUNTRY for
 project 4 instead - same floors/windows/grace as any other project, just computed from that
 country's own today/yesterday totals and its own local hour. See P4_COUNTRIES/
 P4_COUNTRY_TIMEZONES/fetch_p4_country_totals()/run_project_level_rules(). LP-level rules
@@ -94,8 +94,7 @@ REG_17_WARN_H, REG_17_CRIT_H, REG_17_MIN_CLICKS_IN_WINDOW = 4, 6, 30
 REG_17_ELIGIBLE_CLICKS_YDAY, REG_17_ELIGIBLE_REGS_YDAY = 100, 30
 FTD_01_WINDOW_LOW_H, FTD_01_WINDOW_HIGH_H, FTD_01_LOW_FLOOR_YDAY = 3, 6, 50
 DEP_01_WINDOW_H = 2
-DAT_01_WINDOW_H = 3
-DAT_01_FEEDS = ('clicks', 'registrations', 'ftds', 'deposits')
+STALL_FEEDS = ('clicks', 'registrations', 'ftds', 'deposits')  # the four running totals checked (and snapshotted) every run
 
 # Eligibility floors added 2026-11-16 (finding: 85% of hourly runs fired an alert, almost
 # all of it noise) - confirmed live on the real deployed data: Brazino777.py/.bet.br/.in
@@ -104,11 +103,6 @@ DAT_01_FEEDS = ('clicks', 'registrations', 'ftds', 'deposits')
 # 2-3h" is just normal for a project that gets a trickle of traffic, not an incident.
 CLK_01_ELIGIBLE_CLICKS_YDAY = 100
 DEP_01_ELIGIBLE_DEPOSITS_YDAY = 10
-DAT_01_FEED_FLOORS = {'clicks': CLK_01_ELIGIBLE_CLICKS_YDAY, 'registrations': 5,
-                       'deposits': DEP_01_ELIGIBLE_DEPOSITS_YDAY}  # 'ftds' added below, once
-                       # FTD_01_ELIGIBLE_FTDS_YDAY exists - was a separate hardcoded "2" before
-                       # the 2026-11-17 floor raise, which could have drifted from that constant;
-                       # referencing it here instead makes that impossible going forward.
 # REG-01/FTD-01 already widen their window on a low-volume day (2h->4h, 3h->6h) - but a
 # WIDER window doesn't help when yesterday's volume is literally 0 (confirmed live: several
 # of the same noisy alerts above read "yesterday's regs=0"/"yesterday's FTDs=0" in their own
@@ -125,9 +119,8 @@ REG_01_ELIGIBLE_REGS_YDAY = 5
 # project's own real range.
 # Raised 5->20 on 2026-11-26 (user, after the hourly noise replay): Brazino777.ar (~10 FTDs/day, clustered
 # in the evening) fired FTD-01 for 8 straight hours on 11-25 with a legitimately flat daytime - at that
-# volume FTDs arrive in bursts, so "flat for 7h" is normal, not a stall. Also applies to DAT-01 (ftds).
+# volume FTDs arrive in bursts, so "flat for 7h" is normal, not a stall.
 FTD_01_ELIGIBLE_FTDS_YDAY = 20
-DAT_01_FEED_FLOORS['ftds'] = FTD_01_ELIGIBLE_FTDS_YDAY
 
 # "Hasn't started yet" grace period, added 2026-11-17 (real production evidence): 3 separate
 # projects (including Brazino777.io, a healthy 533-regs/day project) fired REG-01/DEP-01 at
@@ -182,7 +175,7 @@ def local_hour_for(now, tz_name):
 # Project 4 (Brazino777.io) per-country split, added 2026-11-17 (user-confirmed: "io is
 # Argentina, Bolivia, Chile, Colombia, Ecuador and Venezuela" - matches the traffic repo's own
 # P4_COUNTRIES, not invented here). A single project-level check for project 4 would mix 6
-# countries' volume/timezone together - CLK-01/REG-01/FTD-01/DEP-01/DAT-01 run once per country
+# countries' volume/timezone together - CLK-01/REG-01/FTD-01/DEP-01 run once per country
 # for this project instead, via run_project_level_rules() below. LP-level rules (CLK-17/REG-17)
 # are NOT split this way - a landing page has no country field joined here, so project 4's LPs
 # still fall back to this container's own Athens hour (local_hour_for(now, None)).
@@ -415,12 +408,6 @@ def lp_dominant_partner_am(engine, landing_id, today, metric_col):
 
 
 # ------------------------------------------------------------- rule evaluators
-# feed -> the rule that already watches that exact feed. DAT-01 ("data freshness") tested the SAME
-# series with the same logic, so one stall produced two alerts (132 of 276 alert-hours in the
-# 11-18..11-26 replay). It now fires only when the feed's own rule did NOT fire for the entity.
-FEED_OWN_RULE = {'clicks': 'CLK-01', 'registrations': 'REG-01', 'ftds': 'FTD-01', 'deposits': 'DEP-01'}
-
-
 def _stall_alert(rule_id, metric_label, level, label, pid, old_v, latest_v, window, note_extra=''):
     return {
         'rule_id': rule_id, 'metric': metric_label, 'level': level, 'entity': label,
@@ -431,27 +418,24 @@ def _stall_alert(rule_id, metric_label, level, label, pid, old_v, latest_v, wind
 
 def run_project_level_rules(state, now, pid, label, t, local_hour, alerts, entity_key='Project',
                             level='Project', profile=None, profile_entity=None):
-    """Runs CLK-01/REG-01/FTD-01/DEP-01/DAT-01 for one project-level entity - a whole project for
+    """Runs CLK-01/REG-01/FTD-01/DEP-01 for one project-level entity - a whole project for
     every project except 4, or (project 4 only, see P4_COUNTRIES) one of its countries, each with
     its own totals/local_hour/state history (`entity_key` keeps a country's snapshot history
     separate from every other country's and from a plain project's). Appends any fired alerts to
     `alerts` in place.
 
-    2026-11-26 rework (see hourly_logic.py): reset-aware stall check (A), DAT-01 only when the
-    feed's own rule did not fire (B), expected-events window from the entity's own hourly profile
+    2026-11-26 rework (see hourly_logic.py): reset-aware stall check (A), expected-events window from the entity's own hourly profile
     (C). Every project, Argentina included, is checked all day by the same rules (the E settle-hour special case was removed 2026-11-26)."""
     profile = profile or {}
     pe = profile_entity if profile_entity is not None else str(pid)
 
-    # one snapshot per feed per run (the old code appended a second, duplicate point for DAT-01)
-    hists = {f: append_snapshot(state, f'{pid}|{f}|{entity_key}', now, t[f]['today']) for f in DAT_01_FEEDS}
+    # one snapshot per feed per run
+    hists = {f: append_snapshot(state, f'{pid}|{f}|{entity_key}', now, t[f]['today']) for f in STALL_FEEDS}
 
     def window_for(feed, base):
         y = t[feed]['yesterday']
         entry = profile.get((pe, feed))
         return choose_window(base, lambda w: expected_events(entry, now, w, y))
-
-    fired = set()
 
     def check(feed, rule_id, metric_label, base, floor, note_fn=None):
         y = t[feed]['yesterday']
@@ -464,7 +448,6 @@ def run_project_level_rules(state, now, pid, label, t, local_hour, alerts, entit
         if stalled:
             extra = note_fn(w, y) if note_fn else ''
             alerts.append(_stall_alert(rule_id, metric_label, level, label, pid, old_v, latest_v, w, extra))
-            fired.add(rule_id)
 
     check('clicks', 'CLK-01', 'Clicks', CLK_01_WINDOW_H, CLK_01_ELIGIBLE_CLICKS_YDAY)
     reg_base = lambda y: REG_01_WINDOW_HIGH_H if y < REG_01_LOW_FLOOR_YDAY else REG_01_WINDOW_LOW_H
@@ -474,23 +457,6 @@ def run_project_level_rules(state, now, pid, label, t, local_hour, alerts, entit
     check('ftds', 'FTD-01', 'FTDs', ftd_base, FTD_01_ELIGIBLE_FTDS_YDAY,
           lambda w, y: f" (window={w:g}h, yesterday's FTDs={y:.0f})")
     check('deposits', 'DEP-01', 'Deposit events', DEP_01_WINDOW_H, DEP_01_ELIGIBLE_DEPOSITS_YDAY)
-
-    for feed in DAT_01_FEEDS:
-        if FEED_OWN_RULE[feed] in fired:
-            continue  # same series, already alerted by its own rule
-        if t[feed]['yesterday'] < DAT_01_FEED_FLOORS[feed]:
-            continue
-        w = window_for(feed, DAT_01_WINDOW_H)
-        if w is None:
-            continue
-        stalled, old_v, latest_v, _ = had_no_increase_in(hists[feed], now, w, local_hour=local_hour)
-        if stalled:
-            alerts.append({
-                'rule_id': 'DAT-01', 'metric': f'Data freshness ({feed})', 'level': level,
-                'entity': label, 'project_id': pid, 'value': latest_v, 'baseline': old_v,
-                'severity': 'CRITICAL',
-                'note': f'{feed} feed stale: no increase in >= {w:g}h (was {old_v}, still {latest_v})',
-            })
 
 
 def load_profile(today):
@@ -708,7 +674,7 @@ def send_am_chat_messages(alerts, now):
     own Telegram chat - additive alongside the existing single shared-chat send in __main__, not
     a replacement for it. Personal = CLK-17/REG-17 alerts whose dominant partner (see
     lp_dominant_partner_am()) is that AM's own; global = every project-level alert
-    (CLK-01/REG-01/FTD-01/DEP-01/DAT-01 - always market-wide, never personally attributed, same
+    (CLK-01/REG-01/FTD-01/DEP-01 - always market-wide, never personally attributed, same
     precedent as the daily pipeline never routing a PLATFORM-scope alert to one AM) plus any
     LP-level alert whose dominant partner has no AM tag (nowhere else for it to go). An AM with
     neither today sees nothing sent, same "zero alerts -> send nothing" rule this hourly job
@@ -729,7 +695,7 @@ def format_hourly_message(alerts, now):
 
     FIX (2026-11-18, user: "split the io per country and show me the alerts for each country as
     if they were different projects"): a Country-level row (project 4's own per-country
-    CLK-01/REG-01/FTD-01/DEP-01/DAT-01, see run_project_level_rules()'s own `level='Country'`)
+    CLK-01/REG-01/FTD-01/DEP-01, see run_project_level_rules()'s own `level='Country'`)
     now gets its OWN top-level group, keyed by its already-distinct entity label
     ("Brazino777.io (AR)") exactly like any other project's group - not nested one level down
     under a shared "Brazino777.io" header with that same label repeated a second time inside the
@@ -748,9 +714,6 @@ def format_hourly_message(alerts, now):
     no detection logic touched."""
     import html as _html, re as _re
 
-    FEED_LABEL = {'clicks': 'Clicks feed', 'registrations': 'Registrations feed',
-                  'ftds': 'FTD feed', 'deposits': 'Deposits feed'}
-
     def _num(s):
         try:
             return f"{float(s.replace(',', '')):,.0f}"
@@ -759,13 +722,7 @@ def format_hourly_message(alerts, now):
 
     def _humanize(a):
         rid, note, metric, entity = a['rule_id'], a['note'], a['metric'], a['entity']
-        if rid == 'DAT-01':
-            m = _re.match(r'^(\w+) feed stale: no increase in >= ([\d.]+)h \(was ([\d.]+), still ([\d.]+)\)$', note)
-            if m:
-                feed, window, _old, latest = m.groups()
-                label = FEED_LABEL.get(feed, f'{feed} feed')
-                return f"{label} stopped updating: still showing {_num(latest)}, no change in over {float(window):.0f}h"
-        elif rid == 'REG-17':
+        if rid == 'REG-17':
             m = _re.match(r'^([\d,]+) clicks in the last ([\d.]+)h, 0 registrations(.*)$', note)
             if m:
                 clicks, window, extra = m.groups()

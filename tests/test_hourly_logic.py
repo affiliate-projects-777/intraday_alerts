@@ -99,10 +99,20 @@ def _run(pid, hours_values, yday, now_hour):
         main.run_project_level_rules(state, now, pid, 'X', _t(d=d, yd=yday), 12, alerts)
     return alerts
 
-def test_dat01_is_suppressed_when_own_rule_fires():
+def test_data_freshness_dat01_is_gone():
+    # removed 2026-11-26: it tested the same totals as CLK/REG/FTD/DEP-01
+    assert not hasattr(main, 'DAT_01_WINDOW_H') and not hasattr(main, 'DAT_01_FEED_FLOORS') and not hasattr(main, 'FEED_OWN_RULE')
     a = _run(3, [(h, 50) for h in range(8, 16)], yday=400, now_hour=15)
-    rules = [x['rule_id'] for x in a]
-    assert 'DEP-01' in rules and 'DAT-01' not in rules
+    assert [x['rule_id'] for x in a] == ['DEP-01']
+
+def test_low_volume_registrations_flat_3h_no_longer_fires_a_separate_feed_alert():
+    # yesterday 50 regs: REG-01 base window 4h; DAT-01 used to alert earlier at 3h flat
+    state, alerts = {}, []
+    for h in range(8, 12):
+        now = pd.Timestamp(f'{D} {h:02d}:00'); alerts.clear()
+        main.run_project_level_rules(state, now, 3, 'X', _t(r=20, yr=50), 12, alerts)
+    assert alerts == []                                   # flat 3h, REG-01 still waits for its own window
+
 
 def test_argentina_is_checked_all_day_like_every_other_project():
     # the old special case skipped project 6 before 12:00 Athens; now a flat running total alerts at any hour

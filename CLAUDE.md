@@ -62,7 +62,7 @@ idempotency guard (`data/telegram_sent_log.json`, one send per eval_date). See
 - `main.py` - the whole thing: `fetch_project_totals()`/`fetch_lp_totals()` (direct SQL
   via SQLAlchemy, no ORM), `had_no_increase_in()`/`append_snapshot()` (pure, same logic
   as `intraday_check.py`), the seven rule evaluators (`CLK-01`, `CLK-17`, `REG-01`,
-  `REG-17`, `FTD-01`, `DEP-01`, `DAT-01`), `run_once()` wiring it together.
+  `REG-17`, `FTD-01`, `DEP-01`; DAT-01 removed 2026-11-26), `run_once()` wiring it together.
 - `cron/scheduler.cron` - `0 * * * *` (hourly, on the hour). `entrypoint.sh` also runs
   it once immediately on container start/deploy, so the first data point doesn't wait
   a full hour.
@@ -142,7 +142,7 @@ Replay of 13 days of real runs showed ~85% of hourly runs alerting, mostly noise
 in `hourly_logic.py` (pure, tested in `tests/test_hourly_logic.py`):
 - **A** reset-aware stall check: a counter drop (Brazino777.ar is restated ~12:00 Athens) discards
   earlier history; stall = no strict increase between consecutive snapshots in the window.
-- **B** DAT-01 fires only if the feed's own rule (CLK/REG/FTD/DEP-01) did not.
+- **B (superseded 2026-11-26)** DAT-01 (data freshness) was removed entirely: it tested the same four totals as CLK/REG/FTD/DEP-01.
 - **C** window = shortest >= base (<=12h) with >=4.6 expected events from the entity's own hourly
   profile (last 7 days of `intraday_results.jsonl`; falls back to yesterday/24 per hour with <3 days
   of history, e.g. project 4 countries until `raw.p4_country_totals` accumulates). Too sparse at

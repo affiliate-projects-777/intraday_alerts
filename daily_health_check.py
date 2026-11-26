@@ -65,6 +65,37 @@ PROJECTS = {
 # single-country brands (.ar/.in/.py) by project_id itself, so they don't need this.
 P4_COUNTRIES = ['AR', 'BO', 'CL', 'CO', 'EC', 'VE']
 
+
+def project_runs():
+    """Expands PROJECTS into (project_id, country, label, sheet_key) run-units - ONE run per
+    real project, EXCEPT project 4 (Brazino777.io), which expands into 6 separate per-country
+    runs (user, 2026-11-18: "each country as a project", instead of one aggregate run lumping
+    AR/BO/CL/CO/EC/VE together). `project_id` passed to pull_project()/RuleEngine is always the
+    REAL db id (4 for every one of those 6) - `country` is an extra filter on top (see
+    pull_project()'s own docstring), never a synthetic project_id. Each run-unit otherwise goes
+    through the EXACT same per-iteration pipeline (pull -> RuleEngine -> apply_correlation ->
+    attribute_alerts -> apply_suppression -> daily_notifications -> own Excel sheet -> own
+    Telegram brand section) as any other real project already did - no new cross-project
+    merge/dedup logic, so none of the 6 country runs can contaminate another's alerts,
+    suppression, or correlation.
+
+    `sheet_key` is a short, Excel-sheet-name-safe identifier, unique across the expanded list
+    (project_id alone would repeat 6x for project 4) - e.g. '4CO', '1'.
+
+    CAVEAT, not resolved here (no DB access this session): every threshold/baseline these 6 new
+    per-country runs inherit is Project 3's own template, carried over unvalidated at this much
+    smaller per-country volume - exactly the same "treat as directional, not calibrated" caveat
+    this workspace already applies to Projects 4/6 as a WHOLE; it now also applies to each of
+    these 6 slices individually, likely more so given the smaller per-slice volume."""
+    runs = []
+    for pid, label in PROJECTS.items():
+        if pid == 4:
+            for country in P4_COUNTRIES:
+                runs.append((pid, country, f'{label} ({country})', f'{pid}{country}'))
+        else:
+            runs.append((pid, None, label, str(pid)))
+    return runs
+
 BUFFER_DAYS = 35  # history pulled before the eval day, for 7-day baselines + multi-day escalation runs
 
 SEV_RANK = {'INFO': 0, 'WARNING': 1, 'CRITICAL': 2}  # for sorting - alphabetical order puts WARNING above CRITICAL
@@ -87,11 +118,51 @@ def _esc(x):
 
 
 def log(msg):
+    # FIX (2026-11-26): requests' connection errors embed the full API URL, which contains the
+    # Telegram bot token - it was being written to run_log.txt in plain text. Redact it here so
+    # no caller can leak it, whatever exception text it logs.
+    msg = re.sub(r'bot\d+:[A-Za-z0-9_-]+', 'bot<redacted>', str(msg))
     line = f"[{dt.datetime.now().isoformat(timespec='seconds')}] {msg}"
     print(line)
     os.makedirs(OUT_DIR, exist_ok=True)
     with open(LOG_PATH, 'a', encoding='utf-8') as f:
         f.write(line + '\n')
+
+
+def wait_for_network(timeout_s=1200, interval_s=30):
+    """FIX (2026-11-26): the 2026-11-24/25/26 scheduled runs fired before the machine's Wi-Fi/
+    VPN DNS was usable (getaddrinfo failed for both the replica and api.telegram.org), so every
+    project pull FAILED and nothing was sent. Block until both hosts the job needs resolve, or
+    give up after `timeout_s`. Returns True when the network is usable, False on timeout."""
+    import socket
+    import time
+    hosts = ['api.telegram.org']
+    replica = os.environ.get('REPLICA_HOST')
+    if replica:
+        hosts.append(replica)
+
+    def _missing():
+        bad = []
+        for h in hosts:
+            try:
+                socket.getaddrinfo(h, 443)
+            except OSError:
+                bad.append(h)
+        return bad
+
+    deadline = time.monotonic() + timeout_s
+    bad = _missing()
+    if not bad:
+        return True
+    log(f"Network not ready (cannot resolve {', '.join(bad)}) - waiting up to {timeout_s // 60} min")
+    while time.monotonic() < deadline:
+        time.sleep(interval_s)
+        bad = _missing()
+        if not bad:
+            log("Network is ready - continuing")
+            return True
+    log(f"Network still not ready after {timeout_s // 60} min (cannot resolve {', '.join(bad)})")
+    return False
 
 
 FINANCE_DOLLAR_RULES = {'FDP-01', 'FDP-02', 'FDP-03', 'AFD-01', 'DPS-01', 'DPS-02', 'DPS-03',
@@ -1172,30 +1243,13 @@ def pd_isna(x):
     return pd.isna(x)
 
 
-def fetch_p4_country_breakdown(eval_date, top_n=3):
-    """Project 4 (Brazino777.io) FTD count by country for one day, for DISPLAY context only on
-    its Telegram alerts - not a new alerting rule/threshold, and not wired into RuleEngine at
-    all (2026-11-05, "include country for project 4" request). Deliberately isolated from
-    pull_project()/the rest of the pipeline: a new per-country rule family would need the same
-    kind of threshold validation the existing traffic-type rules got against real history, which
-    this quick addition does not attempt - it only tells the AM which market(s) a project-4
-    alert is concentrated in, using data already in projects_statistics (just not previously
-    selected). Returns "" if there's nothing to show (e.g. zero FTDs that day)."""
-    import db
-    countries = ','.join(f"'{c}'" for c in P4_COUNTRIES)
-    df = db.replica_run_query(f"""
-        SELECT country, SUM(is_first_depositor) AS ftds
-        FROM projects_statistics
-        WHERE project_id = 4 AND date = '{eval_date.date()}' AND country IN ({countries})
-        GROUP BY country
-        HAVING ftds > 0
-        ORDER BY ftds DESC
-    """)
-    if df.empty:
-        return ""
-    top = df.head(top_n)
-    return ', '.join(f"{row['country']} {int(row['ftds'])}" for _, row in top.iterrows())
-
+# fetch_p4_country_breakdown() REMOVED 2026-11-18 (user: "each country as a project"): it was a
+# display-only FTD-by-country annotation bolted onto one lumped "Brazino777.io" alert (2026-11-05
+# "include country for project 4" request) - superseded, not just made redundant, by
+# project_runs() splitting project 4 into 6 real per-country runs with their own alerts. Keeping
+# it would have attached the SAME whole-project breakdown identically to every one of those 6
+# new brand sections. parse_p4_breakdown() (alert_mapping.py) and the `p4_breakdown_dict`
+# plumbing through map_alerts()/run_for_date.py/the simulator were removed in the same change.
 
 TELEGRAM_CHAR_BUDGET = 4000  # safety margin under Telegram's real 4096-char sendMessage cap
 
@@ -1554,6 +1608,11 @@ def main():
         notify_windows('Health check blocked', 'customers/tqa_model/.env is missing - see run_log.txt')
         sys.exit(1)
 
+    if not wait_for_network():
+        # Nothing can be pulled or sent. Not marking anything as sent, so a later run is not blocked.
+        notify_windows('Health check failed', 'No network (DNS) - nothing was checked or sent. See run_log.txt')
+        sys.exit(2)
+
     from health_check_engine import (pull_project, RuleEngine, apply_suppression, apply_correlation,
                                       daily_notifications)
     import pandas as pd
@@ -1571,20 +1630,26 @@ def main():
 
     with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
         summary_rows = []
-        for pid, label in PROJECTS.items():
-            log(f"Project {pid} ({label}): pulling {start}..{end}")
+        for pid, country, label, sheet_key in project_runs():
+            run_desc = f"Project {pid}{' ' + country if country else ''} ({label})"
+            log(f"{run_desc}: pulling {start}..{end}")
             try:
-                ps, promo_map, stats, stats_country = pull_project(pid, start, end)
+                ps, promo_map, stats, stats_country = pull_project(pid, start, end, country=country)
                 if ps.empty:
-                    log(f"Project {pid}: no data in window, skipping")
+                    log(f"{run_desc}: no data in window, skipping")
                     continue
-                eng = RuleEngine(pid, ps, promo_map, stats, all_dates, eval_date, stats_country=stats_country)
+                eng = RuleEngine(pid, ps, promo_map, stats, all_dates, eval_date,
+                                  stats_country=stats_country, country=country)
                 res = eng.run_all()
                 if res.empty:
-                    log(f"Project {pid}: 0 raw alert-rows")
-                    summary_rows.append({'project_id': pid, 'label': label, 'raw_rows': 0, 'actionable_today': 0})
+                    log(f"{run_desc}: 0 raw alert-rows")
+                    summary_rows.append({'project_id': pid, 'country': country, 'label': label,
+                                          'raw_rows': 0, 'actionable_today': 0})
                     continue
                 res['project_id'] = pid  # needed below by attribute_alerts()'s per-row project_id lookup
+                res['country'] = country  # audit-trail only (2026-11-18 per-country split) - distinguishes
+                                           # this run among project 4's 6 country-sheets in the Excel report;
+                                           # not read by attribute_alerts()/apply_suppression()/Telegram.
                 # 'linked_*'/'solo_*'/'dominant_partner'/'entity_linked_rule_ids' columns - see
                 # apply_correlation()'s own docstring (health_check_engine.py) for the declared
                 # identity -> hierarchy-share -> declared-pair order (AUDIT_HISTORY.md finding
@@ -1608,8 +1673,9 @@ def main():
                 total_actionable += n_today
                 if n_today > 0:
                     any_actionable = True
-                log(f"Project {pid}: {len(res)} raw rows, {n_today} actionable notifications today ({eval_date.date()})")
-                summary_rows.append({'project_id': pid, 'label': label, 'raw_rows': len(res), 'actionable_today': n_today})
+                log(f"{run_desc}: {len(res)} raw rows, {n_today} actionable notifications today ({eval_date.date()})")
+                summary_rows.append({'project_id': pid, 'country': country, 'label': label,
+                                      'raw_rows': len(res), 'actionable_today': n_today})
 
                 # 'note' added 2026-11-05 (AM-friendly Telegram design) - already computed by
                 # the engine's emit() calls, just wasn't selected through before; needed for
@@ -1647,7 +1713,7 @@ def main():
                         'dominant_partner', 'dominant_partner_share', 'entity_linked_rule_ids',
                         'formula_linked_rule_ids',
                         'partner_id', 'attribution', 'traffic_type']
-                sheet_today = f'P{pid}_today'[:31]
+                sheet_today = f'P{sheet_key}_today'[:31]
                 todays_out = todays[cols] if not todays.empty else pd.DataFrame(columns=cols)
                 todays_out.to_excel(writer, sheet_name=sheet_today, index=False)
                 if not todays_out.empty:
@@ -1656,11 +1722,12 @@ def main():
                     tr['project_label'] = label
                     telegram_rows.append(tr)
 
-                sheet_all = f'P{pid}_all_open'[:31]
+                sheet_all = f'P{sheet_key}_all_open'[:31]
                 res.sort_values(['date', 'rule_id', 'entity']).to_excel(writer, sheet_name=sheet_all, index=False)
             except Exception:
-                log(f"Project {pid}: FAILED - {traceback.format_exc()}")
-                summary_rows.append({'project_id': pid, 'label': label, 'raw_rows': 'ERROR', 'actionable_today': 'ERROR'})
+                log(f"{run_desc}: FAILED - {traceback.format_exc()}")
+                summary_rows.append({'project_id': pid, 'country': country, 'label': label,
+                                      'raw_rows': 'ERROR', 'actionable_today': 'ERROR'})
 
         pd.DataFrame(summary_rows).to_excel(writer, sheet_name='Summary', index=False)
         notes = pd.DataFrame({'Note': [
@@ -1672,6 +1739,13 @@ def main():
             "Projects covered: all of PROJECTS above (1, 3, 4, 6, 7, 10) - every project except "
             "2 (Wazino777, disabled). A quiet project can still have an alert worth seeing the "
             "day it wakes up (see PROJECTS' own comment), so none are excluded by volume.",
+            # FIX (2026-11-18, user: "each country as a project"): project 4 (Brazino777.io) no
+            # longer runs as one aggregate - it expands into 6 separate per-country runs
+            # (project_runs(), P4_COUNTRIES = AR/BO/CL/CO/EC/VE), each with its own 'P4<CC>_today'/
+            # 'P4<CC>_all_open' sheet pair and its own Telegram brand section ("Brazino777.io
+            # (CC)"). The old aggregate 'P4_today'/'P4_all_open' sheets and the FTD-by-country
+            # display-only breakdown (fetch_p4_country_breakdown()) are both gone - superseded by
+            # real per-country alerting, not just a cosmetic annotation on one lumped alert.
             "'<proj>_today' = actionable (WARNING/CRITICAL) NEW or ESCALATION notifications for eval_date only "
             "- this is the daily inbox. '<proj>_all_open' = every currently-open alert row in the pulled window, "
             "for context/debugging.",
@@ -1679,11 +1753,26 @@ def main():
             "(intraday/continuous, and ones needing an undefined business term) and caveats on the Finance rules.",
             "Thresholds were validated in depth against Project 3's September 2026 data; Projects 4/6 use the "
             "same template thresholds unvalidated against their own volume profile - treat their results as "
-            "directional until spot-checked the way Project 3 was.",
+            "directional until spot-checked the way Project 3 was. Project 4's new 6 per-country slices "
+            "inherit this SAME unvalidated template, now at a materially smaller per-slice volume than the "
+            "aggregate project 4 ever had - flagged, not independently validated against real per-country "
+            "history this session (no DB access).",
         ]})
         notes.to_excel(writer, sheet_name='Methodology', index=False)
 
     log(f"Wrote {out_path}")
+
+    # FIX (2026-11-26): if EVERY project pull failed, the code below would build an empty alert
+    # list and send what looks like an all-clear "no alerts" message even though nothing was
+    # evaluated. Stop here instead, say so loudly, and leave the date unmarked.
+    n_failed = sum(1 for r in summary_rows if r.get('raw_rows') == 'ERROR')
+    if summary_rows and n_failed == len(summary_rows):
+        msg = (f"Health check for {eval_date.date()} could not run: all {n_failed} project data pulls failed "
+               f"(see run_log.txt). Nothing was evaluated - this is NOT an all-clear.")
+        log(msg)
+        send_telegram(f"⚠️ {msg}")
+        notify_windows('Health check failed', f'All project pulls failed for {eval_date.date()} - see run_log.txt')
+        sys.exit(1)
 
     all_alerts = pd.concat(telegram_rows, ignore_index=True) if telegram_rows else pd.DataFrame(
         columns=['date', 'rule_id', 'metric', 'level', 'entity', 'value', 'baseline', 'pct', 'severity',
@@ -1698,11 +1787,24 @@ def main():
     # reuses a few of their low-level helpers (_metric_label(), BUFFER_DAYS), so some are not
     # truly dead; see this session's own summary for which ones are safe to remove and which
     # the new pipeline depends on.
-    from alert_mapping import map_alerts, parse_p4_breakdown
-    from alert_telegram import send_for_date
+    from alert_mapping import map_alerts
+    # --v2 (added 2026-11-18, see alert_render_v2.py's own docstring and AUDIT_HISTORY.md
+    # findings #157-162): for local comparison only - `python daily_health_check.py --v2` sends
+    # the SAME alerts through the spec-draft renderer instead of the production one. Defaults
+    # to v1 (send_for_date) in every other respect, including the scheduled job, which never
+    # passes this flag.
+    v2 = '--v2' in sys.argv[1:]
+    if v2:
+        from alert_telegram import send_for_date_v2 as send_for_date, send_am_chat_messages_v2 as send_am_chat_messages
+    else:
+        from alert_telegram import send_for_date
     import re as _re
-    p4_breakdown_dict = parse_p4_breakdown(
-        fetch_p4_country_breakdown(eval_date)) if (all_alerts['project_id'] == 4).any() else None
+    # FIX (2026-11-18, user: "each country as a project"): fetch_p4_country_breakdown()/
+    # parse_p4_breakdown()'s cosmetic FTD-by-country annotation is gone - project 4's countries
+    # are now real, separately-alerted brand sections (see project_runs()), not one lumped
+    # "Brazino777.io" alert with a country breakdown bolted on. Keeping the old annotation would
+    # now be actively WRONG, not just redundant: it would attach the SAME whole-project FTD
+    # breakdown identically to every one of the 6 new per-country brand sections.
     am_map = fetch_account_managers(all_alerts['partner_id'].dropna().unique().tolist())
     ref_ids = set(all_alerts['partner_id'].dropna().astype(int))
     for col in ('linked_dominant_partner', 'solo_dominant_partner', 'dominant_partner', 'ratio_hint_partner'):
@@ -1716,11 +1818,15 @@ def main():
     # (via send_telegram_for_date()'s pd.Timestamp(eval_date) conversion) the idempotency key -
     # a plain "YYYY-MM-DD" string works for both; passing the raw Timestamp here instead would
     # make the message header read "2026-11-11 00:00:00", not "2026-11-11".
-    typed_alerts = map_alerts(all_alerts, am_map, partner_names, p4_breakdown_dict, str(eval_date.date()))
+    typed_alerts = map_alerts(all_alerts, am_map, partner_names, str(eval_date.date()))
     send_for_date(typed_alerts, str(eval_date.date()))
     # Per-AM chat routing (added 2026-11-17, see alert_telegram.py's AM_TELEGRAM_CHATS) -
-    # additive alongside the shared-chat send above, not a replacement for it.
-    from alert_telegram import send_am_chat_messages
+    # additive alongside the shared-chat send above, not a replacement for it. `send_am_chat_
+    # messages` was already imported (as the v1 or v2 variant, per the `v2` flag above) in the
+    # same `if v2: ... else: ...` block as `send_for_date` - not re-imported here, which would
+    # silently overwrite the v2 alias with v1's.
+    if not v2:
+        from alert_telegram import send_am_chat_messages
     send_am_chat_messages(typed_alerts, str(eval_date.date()))
 
     if total_actionable > 0:

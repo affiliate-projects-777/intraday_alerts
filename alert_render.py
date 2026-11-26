@@ -573,10 +573,18 @@ def _owner_sort_key(owner: str):
 TELEGRAM_CHAR_BUDGET = 3500  # headroom under the real 4096 cap - see alert_telegram.py
 
 
-def build_sections(alerts: List[Alert]):
+def build_sections(alerts: List[Alert], render_block=None):
     """Returns [(owner, [(entity_header_line, [alert_block_lines, ...]), ...]), ...] in final
     display order - the shape alert_telegram.py's splitter consumes (it never needs to re-sort
-    or re-group, only pack and, if needed, repeat a section header on a continuation message)."""
+    or re-group, only pack and, if needed, repeat a section header on a continuation message).
+
+    `render_block` defaults to this module's own render_alert_block() - every existing caller
+    that doesn't pass it (alert_telegram.py's render_html_messages(), the simulator) is
+    unaffected. It exists so alert_render_v2.py's spec-draft block renderer can reuse this exact
+    grouping/sorting/header logic instead of duplicating it (see alert_render_v2.py's own
+    docstring) - the ONLY thing that differs between the two local-test formats is how one
+    Alert's own lines are rendered, never how alerts are grouped or ordered."""
+    render_block = render_block or render_alert_block
     by_owner = {}
     for a in alerts:
         by_owner.setdefault(a.owner, []).append(a)
@@ -595,7 +603,7 @@ def build_sections(alerts: List[Alert]):
                 header = render_partner_header(entity_alerts)
             else:
                 header = render_brand_header(entity_alerts[0].brands[0], entity_alerts)
-            blocks = [render_alert_block(a) for a in entity_alerts]
+            blocks = [render_block(a) for a in entity_alerts]
             entities.append((header, blocks))
         sections.append((owner, entities))
     return sections
@@ -616,12 +624,19 @@ def render_message_header(date: str, alerts: List[Alert]) -> str:
     return _bold(f"Daily health check {EM_DASH} {date}")
 
 
-def render(alerts: List[Alert], date: str) -> List[str]:
+def render(alerts: List[Alert], date: str, *, render_block=None, render_header=None) -> List[str]:
     """Pure: list[Alert] -> list[str] (one string per Telegram message - §5's char-budget
     splitting lives in alert_telegram.py, which calls build_sections()/render_message_header()
-    directly rather than re-parsing this function's plain-text output)."""
-    sections = build_sections(alerts)
-    lines = [render_message_header(date, alerts)]
+    directly rather than re-parsing this function's plain-text output).
+
+    `render_block`/`render_header` default to this module's own render_alert_block()/
+    render_message_header() - every existing caller that doesn't pass them is unaffected. See
+    build_sections()'s own docstring: alert_render_v2.py's render_v2() is just this function
+    called with its own block/header renderers, so the two local-test formats can never drift
+    on grouping/ordering, only on per-alert wording."""
+    render_header = render_header or render_message_header
+    sections = build_sections(alerts, render_block=render_block)
+    lines = [render_header(date, alerts)]
     for owner, entities in sections:
         lines.append("")
         lines.append(render_section_header(owner))

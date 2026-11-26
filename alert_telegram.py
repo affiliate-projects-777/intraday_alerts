@@ -15,15 +15,23 @@ from alert_types import Alert, PLATFORM
 TELEGRAM_CHAR_LIMIT = 4096
 
 
-def render_html_messages(alerts: List[Alert], date: str) -> List[str]:
+def render_html_messages(alerts: List[Alert], date: str, *, render_block=None, render_header=None) -> List[str]:
     """list[Alert] -> list[str], each <= TELEGRAM_CHAR_LIMIT, HTML-escaped and <code>-wrapped,
     split only at section/entity boundaries (never inside one alert's own block), repeating the
     section header on any continuation message. Uses alert_render.build_sections() directly
     (the structured form) rather than re-parsing render()'s plain-text output - §5 is about
-    layout/limits, not about re-deriving anything from text."""
+    layout/limits, not about re-deriving anything from text.
+
+    `render_block`/`render_header` default to alert_render.py's own v1 functions - every
+    existing caller (send_for_date(), send_am_chat_messages()) that doesn't pass them is
+    unaffected. render_html_messages_v2() below is just this function called with
+    alert_render_v2's block/header renderers, so the char-budget splitting logic is never
+    duplicated between the two local-test formats."""
+    render_block = render_block or alert_render.render_alert_block
+    render_header = render_header or alert_render.render_message_header
     with alert_render.html_mode():
-        sections = alert_render.build_sections(alerts)
-        header_line = alert_render.render_message_header(date, alerts)
+        sections = alert_render.build_sections(alerts, render_block=render_block)
+        header_line = render_header(date, alerts)
         chunks = []  # (owner, section_header_line, entity_chunk_text)
         for owner, entities in sections:
             section_header = alert_render.render_section_header(owner)
@@ -80,6 +88,42 @@ def send_for_date(alerts: List[Alert], date: str, force: bool = False):
     messages = render_html_messages(alerts, date)
     dhc.send_telegram_for_date(date, messages, force=force)
     return messages
+
+
+# ================================================================= v2 (spec-draft format, local testing only)
+# Added 2026-11-18 (user: "create a second version of messaging i can test locally... keep the
+# original too... --v2 to test the new messaging so i can compare") - see alert_render_v2.py's
+# own module docstring and AUDIT_HISTORY.md findings #157-162 (the 2026-11-18 Telegram-
+# messaging-spec audit this is the draft implementation of). NOT used by daily_health_check.py's
+# main() or run_for_date.py unless the `--v2` flag is passed - send_for_date()/
+# send_am_chat_messages() above are completely unaffected, byte-for-byte, by this section.
+def render_html_messages_v2(alerts: List[Alert], date: str) -> List[str]:
+    import alert_render_v2 as v2
+    return render_html_messages(alerts, date, render_block=v2.render_alert_block_v2,
+                                 render_header=v2.render_message_header_v2)
+
+
+def send_for_date_v2(alerts: List[Alert], date: str, force: bool = False):
+    import daily_health_check as dhc
+    messages = render_html_messages_v2(alerts, date)
+    dhc.send_telegram_for_date(date, messages, force=force)
+    return messages
+
+
+def send_am_chat_messages_v2(alerts: List[Alert], date: str):
+    """v2 counterpart of send_am_chat_messages() below - same per-AM routing, same
+    AM_TELEGRAM_CHATS, only the rendering differs."""
+    import daily_health_check as dhc
+    out = {}
+    for am, chat_id in AM_TELEGRAM_CHATS.items():
+        subset = [a for a in alerts if a.owner == am or a.owner == PLATFORM]
+        if not subset:
+            continue
+        messages = render_html_messages_v2(subset, date)
+        out[am] = messages
+        for msg in messages:
+            dhc.send_telegram_to_chat(msg, chat_id)
+    return out
 
 
 # ================================================================= per-AM chat routing

@@ -180,7 +180,15 @@ PROJECT_TARGET_COUNTRIES = {
 
 
 # ================================================================= DATA PULL
-def pull_project(project_id, start, end):
+def pull_project(project_id, start, end, country=None):
+    """`country`, when given (e.g. 'CO'), restricts `ps`/`stats`/`stats_country` to that one
+    country's own rows - the real per-country split (user: "each country as a project", 2026-
+    11-18) for `project_id=4` (Brazino777.io, the one genuinely multi-country brand - see
+    PROJECT_TARGET_COUNTRIES's own comment). `project_id` passed to the DB is always the REAL
+    project_id (4) either way; `country` is an extra filter on top, not a different project_id -
+    `projects_statistics`/`promo_statistics_countries` have no per-country project_id of their
+    own. Every other caller (every other project_id, and project_id=4 itself if ever called
+    without `country`) is unaffected - this parameter defaults to None, same shape as before."""
     # tag_id 41 = "Test" in partner_tags (confirmed 2026-11-10 via partner_11414 - real,
     # growing click volume spread near-evenly across every project with ~0 regs/FTDs, which
     # looked like a cross-project funnel break until the tag confirmed it's a test account).
@@ -209,13 +217,14 @@ def pull_project(project_id, start, end):
     # minus each partner's OWN RS (partner_profit) floored at 0 before summing across partners -
     # not the raw program_profit column, which that file's own comment confirms can let one
     # partner's negative-RS month net against another's positive one if just summed directly.
+    country_clause = f"AND country = '{country}'" if country else ""
     ps = replica_run_query(f"""
         SELECT date, partner_id, promo_id, customer_id,
                payments, payouts, bonuses, chargebacks, cpa_amount,
                bets, wins, total_profit, admin_fee, partner_profit,
                is_first_depositor, first_deposit_amount, number_of_deposits
         FROM projects_statistics
-        WHERE project_id = {int(project_id)} AND date >= '{start}' AND date <= '{end}'
+        WHERE project_id = {int(project_id)} AND date >= '{start}' AND date <= '{end}' {country_clause}
     """)
     ps = ps[~ps['partner_id'].isin(excluded_partners)].copy()
     for c in ['payments', 'payouts', 'bonuses', 'chargebacks', 'cpa_amount', 'bets', 'wins',
@@ -277,7 +286,7 @@ def pull_project(project_id, start, end):
             SELECT date, promo_id, country, SUM(clicks) AS clicks, SUM(unique_clicks) AS unique_clicks,
                    SUM(registrations) AS registrations
             FROM promo_statistics_countries
-            WHERE promo_id IN ({ids_str}) AND date >= '{start}' AND date <= '{end}'
+            WHERE promo_id IN ({ids_str}) AND date >= '{start}' AND date <= '{end}' {country_clause}
             GROUP BY date, promo_id, country
         """)
         stats = stats_country.groupby(['date', 'promo_id'], as_index=False)[['clicks', 'unique_clicks', 'registrations']].sum()
@@ -374,7 +383,8 @@ def masked_share(hit_mask_df, eligible_mask_df, min_eligible=3):
 
 
 class RuleEngine:
-    def __init__(self, project_id, ps, promo_map, stats, all_dates, eval_date, stats_country=None):
+    def __init__(self, project_id, ps, promo_map, stats, all_dates, eval_date, stats_country=None,
+                 country=None):
         self.project_id = project_id
         self.ps = ps
         self.promo_map = promo_map
@@ -383,6 +393,14 @@ class RuleEngine:
         # test that builds a RuleEngine with the old 6-arg signature keeps working unchanged -
         # GEO-01 just doesn't fire (no results appended) when it's not supplied.
         self.stats_country = stats_country
+        # `country`, when given, means `ps`/`stats`/`stats_country` were ALREADY filtered to one
+        # country by pull_project() (user: "each country as a project", 2026-11-18, for project 4
+        # /Brazino777.io - see PROJECT_TARGET_COUNTRIES's own comment). Used here only to (a)
+        # scope the two rules that issue their OWN direct SQL rather than reading self.ps/
+        # self.stats (run_retention()'s RET-02 wide pull, run_roas()'s listing-fee lookup) and
+        # (b) skip GEO-01 (run_geo()), which becomes structurally vacuous once every row is
+        # already one country - see run_geo()'s own early-return.
+        self.country = country
         self.all_dates = all_dates
         self.eval_date = eval_date  # the single day we report "today's" alerts for (usually yesterday)
         self.results = []
@@ -938,10 +956,15 @@ class RuleEngine:
         d30_end = self.eval_date - pd.Timedelta(days=30)
         wide_start = (d30_end - pd.Timedelta(days=65)).strftime('%Y-%m-%d')
         wide_end = self.eval_date.strftime('%Y-%m-%d')
+        # Country-scoped the same way pull_project() scopes `self.ps` (2026-11-18 per-country
+        # split) - this query bypasses self.ps entirely (its own wider window), so without this
+        # clause a per-country run (e.g. project 4/CO) would silently compute D30 retention over
+        # ALL of project 4's customers across every country, not just CO's own.
+        wide_country_clause = f"AND country = '{self.country}'" if getattr(self, 'country', None) else ""
         wide = replica_run_query(f"""
             SELECT date, customer_id FROM projects_statistics
             WHERE project_id = {int(self.project_id)} AND date >= '{wide_start}' AND date <= '{wide_end}'
-              AND payments > 0
+              AND payments > 0 {wide_country_clause}
         """)
         wide['date'] = pd.to_datetime(wide['date'])
         wide_deposits = wide[['date', 'customer_id']].drop_duplicates()
@@ -1030,8 +1053,18 @@ class RuleEngine:
         # spec's own numbers (Project_Health_Monitoring_Framework_FINAL_v2.xlsx rows 59-60), not
         # independently re-validated against this project's real history the way Project 3's
         # original thresholds were - revisit if live monitoring shows these too chatty or quiet.
+        # FIX (2026-11-18, "revisit if live monitoring shows these too chatty" above, now
+        # confirmed real): Brazino777.in's own Depositors baseline sits at ~5-6/day, so a plain
+        # drop to 2 reads as a "60-65% drop" and escalated to CRITICAL two days running - noise
+        # from a tiny absolute count, not a real signal, the same small-counts-swing-harder-in-%
+        # gap Fix 12 already fixed for CLK/REG/FTD-02/03 but never extended to this later-added
+        # rule. Floor set to 20, same as FTD-02/03's own PROJ_FLOOR (a depositor count sits
+        # between Registrations and FTDs in the funnel, so FTDs' floor is the closer analogy) -
+        # not independently re-validated against this project's real history either, same caveat
+        # as the thresholds above; revisit if 20 still proves too loose or too tight live.
+        DEP_03_FLOOR = 20
         dep_ct_b = baseline(self.proj_depositors); dep_ct_pct = pctchg(self.proj_depositors, dep_ct_b)
-        self.emit('DEP-03', 'Depositors', 'Project', 'Project', dep_ct_pct <= -20, self.proj_depositors, dep_ct_b, dep_ct_pct, '')
+        self.emit('DEP-03', 'Depositors', 'Project', 'Project', (dep_ct_pct <= -20) & (dep_ct_b >= DEP_03_FLOOR), self.proj_depositors, dep_ct_b, dep_ct_pct, '')
 
         dep_this7 = self.proj_depositors.rolling(7).sum()
         dep_prev7 = self.proj_depositors.shift(7).rolling(7).sum()
@@ -1184,10 +1217,26 @@ class RuleEngine:
             if days_in_range <= 0:
                 continue
             next_month = month_start + pd.offsets.MonthBegin(1)
+            # Country-scoped the same way pull_project() scopes `self.ps` (2026-11-18 per-
+            # country split): without this, every one of project 4's 6 per-country ROA-01 runs
+            # would each pull the WHOLE project's listing-fee total, inflating "investment" (and
+            # understating ROAS) 6x over. CAVEAT, not resolved here: this scopes a promo in by
+            # whether it had ANY activity in this country that month (via projects_statistics'
+            # own country column) - a promo that genuinely serves more than one of project 4's
+            # countries would have its FULL monthly fee counted toward EACH country it touched,
+            # not apportioned between them (the same "shared-promo allocation logic isn't fully
+            # derivable from raw tables" caveat this workspace's own conventions already flag for
+            # listing-fee figures generally - see "Prefer admin export for cost" memory). Not
+            # expected to matter for most promos (traffic_type conventions suggest most are
+            # single-country in practice), but not verified against real data this session (no
+            # DB access) - flag, don't silently trust, if ROA-01 numbers for project 4's
+            # countries look off.
+            ppm_country_clause = f"AND country = '{self.country}'" if getattr(self, 'country', None) else ""
             row = replica_run_query(f"""
                 SELECT COALESCE(SUM(plf.amount), 0) AS fee
                 FROM promo_listing_fees plf
-                JOIN (SELECT DISTINCT promo_id FROM projects_statistics WHERE project_id = {int(self.project_id)}) ppm
+                JOIN (SELECT DISTINCT promo_id FROM projects_statistics
+                      WHERE project_id = {int(self.project_id)} {ppm_country_clause}) ppm
                   ON ppm.promo_id = plf.promo_id
                 WHERE plf.effective_from < '{next_month.strftime('%Y-%m-%d')}'
                   AND (plf.effective_to IS NULL OR plf.effective_to >= '{month_start.strftime('%Y-%m-%d')}')
@@ -1310,6 +1359,13 @@ class RuleEngine:
         spec's own explicitly-marked "(placeholder)" (Project_Health_Monitoring_Framework_
         FINAL_v2.xlsx row 96) - not independently validated against this project's real history
         the way Project 3's original thresholds were."""
+        if getattr(self, 'country', None):
+            # Once a project has already been sliced to one country by pull_project() (the
+            # 2026-11-18 per-country split), every row IS that country by construction - "share
+            # of registrations from outside the target market" can only ever read 0%, so this
+            # rule would be pure noise-free dead weight, not a real check. Skip it rather than
+            # emit a permanently-zero result for every one of project 4's 6 per-country runs.
+            return
         if self.stats_country is None or self.stats_country.empty:
             return
         target = PROJECT_TARGET_COUNTRIES.get(self.project_id)

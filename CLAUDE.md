@@ -85,6 +85,19 @@ idempotency guard (`data/telegram_sent_log.json`, one send per eval_date). See
 ships as-is. If that project's files change, re-copy them here rather than hand-editing
 these copies, or the two will drift.
 
+**Re-synced 2026-11-26 (three-way merge, not a plain copy).** The two copies had drifted both
+ways: this repo had the 2026-11-24 formula-link correlation commits (`FormulaPairNote`,
+`formula_linked_rule_ids`) that `traffic` lacked, and `traffic` had the per-country project 4
+split (`project_runs()`, `pull_project(country=)`), the `--v2` renderer (`alert_render_v2.py`),
+and new 2026-11-26 guards. Before this, the container still ran project 4 as one lumped
+"Brazino777.io" with a country-breakdown annotation, so project 4 alerts mostly landed under
+"Not partner-specific" instead of reaching their AM. Verified by running both code trees
+end to end for 2026-11-25 against the replica with Telegram stubbed: byte-identical messages.
+New in `daily_health_check.py`: `wait_for_network()` (waits for DNS before pulling), an
+"all projects failed" guard (sends a "NOT an all-clear" notice instead of an empty report),
+and bot-token redaction in `log()`. `intraday_check.py` and `run_for_date.py` are local-only
+tools and are not part of this deploy.
+
 - `db.py` - a ~20-line shim exposing only `replica_run_query()`, the one function this
   pipeline actually calls from the real `customers/tqa_model/db.py` (confirmed by grep
   before writing it - that file's other functions and the VIEWS_*/AZINO_*/ADMIRAL_*/

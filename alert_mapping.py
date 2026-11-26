@@ -313,11 +313,15 @@ def _brands_for(row) -> tuple:
     return (row['project_label'],)
 
 
-def _geo_mix_for(row, p4_breakdown_dict: Optional[dict]) -> Optional[dict]:
-    return p4_breakdown_dict if row.get('project_id') == 4 and p4_breakdown_dict else None
-
-
-def _single_alert_from_row(row, am_map, partner_names, p4_breakdown_dict, date) -> Alert:
+# _geo_mix_for()/parse_p4_breakdown() REMOVED 2026-11-18 (user: "each country as a project"):
+# geo_mix was only ever populated from fetch_p4_country_breakdown()'s whole-project-4 FTD-by-
+# country breakdown, bolted onto one lumped "Brazino777.io" alert. Now that project 4 is 6 real
+# per-country runs (daily_health_check.project_runs()) each with its own alerts/brand section,
+# that annotation would be actively wrong - the same whole-project breakdown repeated
+# identically on all 6 new brand sections. Alert.geo_mix itself stays in alert_types.py/
+# alert_render.py (generic, still usable by a future brand that needs it) - nothing here sets it
+# anymore.
+def _single_alert_from_row(row, am_map, partner_names, date) -> Alert:
     rule_id = row['rule_id']
     severity = _severity_for(row)
     lifecycle, lifecycle_day = _lifecycle_for(row)
@@ -340,7 +344,7 @@ def _single_alert_from_row(row, am_map, partner_names, p4_breakdown_dict, date) 
         return Alert(date=date, owner=owner, scope=scope, brands=_brands_for(row),
                      partner=partner, severity=severity, lifecycle=lifecycle,
                      lifecycle_day=lifecycle_day, type=AlertType.STREAK, metric=metric,
-                     streak=streak, notes=notes, geo_mix=_geo_mix_for(row, p4_breakdown_dict))
+                     streak=streak, notes=notes)
 
     if rule_id in _BREADTH_RULE_IDS:
         n_dropped, n_eligible = row['value'], row['baseline']
@@ -349,13 +353,13 @@ def _single_alert_from_row(row, am_map, partner_names, p4_breakdown_dict, date) 
         return Alert(date=date, owner=owner, scope=scope, brands=_brands_for(row),
                      partner=partner, severity=severity, lifecycle=lifecycle,
                      lifecycle_day=lifecycle_day, type=AlertType.BREADTH, metric=metric,
-                     breadth=breadth, notes=notes, geo_mix=_geo_mix_for(row, p4_breakdown_dict))
+                     breadth=breadth, notes=notes)
 
     deviation = _deviation_data_for(row, metric.unit)
     return Alert(date=date, owner=owner, scope=scope, brands=_brands_for(row), partner=partner,
                  dimension=_dimension_for(row), severity=severity, lifecycle=lifecycle,
                  lifecycle_day=lifecycle_day, type=AlertType.DEVIATION, metric=metric,
-                 deviation=deviation, notes=notes, geo_mix=_geo_mix_for(row, p4_breakdown_dict))
+                 deviation=deviation, notes=notes)
 
 
 def _deviation_data_for(row, unit: Unit) -> DeviationData:
@@ -378,7 +382,7 @@ def _deviation_data_for(row, unit: Unit) -> DeviationData:
     return DeviationData(value=value, baseline=dev_baseline, baseline_type=baseline_type)
 
 
-def _incident_from_cluster(rows: List, am_map, partner_names, p4_breakdown_dict, date) -> Alert:
+def _incident_from_cluster(rows: List, am_map, partner_names, date) -> Alert:
     """rows: the cluster's member DataFrame rows (same grouping key as daily_health_check.py's
     render_rows()/group_key() - project_id + linked_dominant_partner), highest severity first."""
     rows = sorted(rows, key=lambda r: 0 if r['severity'] == 'CRITICAL' else 1)
@@ -396,8 +400,7 @@ def _incident_from_cluster(rows: List, am_map, partner_names, p4_breakdown_dict,
     notes = (CustomerConcentrationNote(partner=_partner_ref(dom_p, partner_names), shares_by_metric=shares),)
     return Alert(date=date, owner=owner, scope=Scope.BRAND, brands=_brands_for(first),
                  severity=severity, lifecycle=lifecycle, lifecycle_day=lifecycle_day,
-                 type=AlertType.INCIDENT, lines=lines, notes=notes,
-                 geo_mix=_geo_mix_for(first, p4_breakdown_dict))
+                 type=AlertType.INCIDENT, lines=lines, notes=notes)
 
 
 # TODO (out of scope for this change, per the task's own instruction): "traffic shifted between
@@ -410,18 +413,27 @@ def _incident_from_cluster(rows: List, am_map, partner_names, p4_breakdown_dict,
 # and merge it into one INCIDENT-shaped Alert the way a `linked_rule_ids` cluster already is -
 # deliberately NOT attempted here.
 def map_alerts(df: pd.DataFrame, am_map: Dict[int, str], partner_names: Dict[int, str],
-               p4_breakdown_dict: Optional[dict], date: str) -> List[Alert]:
+               date: str) -> List[Alert]:
     """df: the actionable, post-attribution/post-suppression rows for one eval_date, across all
     projects - exactly `all_alerts` as build_telegram_message() already assembles it, with
     `project_id`/`project_label` columns. Groups `linked_rule_ids` clusters into one INCIDENT
     each (same grouping key daily_health_check.py's render_rows() uses), everything else maps
-    1:1 to a DEVIATION/STREAK/BREADTH Alert."""
+    1:1 to a DEVIATION/STREAK/BREADTH Alert.
+
+    Clusters by `project_label`, not `project_id` - FIX (2026-11-18, same change as the
+    per-country split): project 4's 6 country runs (daily_health_check.project_runs()) all
+    share the SAME real `project_id` (4), but each has its OWN correlation/`linked_rule_ids`
+    computed independently (apply_correlation() runs per-run, before these rows are ever
+    concatenated into `df`). Grouping on `project_id` alone could incorrectly merge two
+    DIFFERENT countries' rows into one INCIDENT if they happened to share a
+    `linked_dominant_partner` id - `project_label` (already unique per real project AND per
+    country run, e.g. "Brazino777.io (CO)" vs "Brazino777.io (BO)") can't collide that way."""
     df = df.copy()
 
     def _cluster_key(row):
         linked = row.get('linked_rule_ids')
         if linked and not pd.isna(linked):
-            return ('cluster', row.get('project_id'), row.get('linked_dominant_partner'))
+            return ('cluster', row.get('project_label'), row.get('linked_dominant_partner'))
         return ('single', row.name)
 
     df['_key'] = df.apply(_cluster_key, axis=1)
@@ -429,24 +441,16 @@ def map_alerts(df: pd.DataFrame, am_map: Dict[int, str], partner_names: Dict[int
     for key, grp in df.groupby('_key', sort=False):
         rows = [r for _, r in grp.iterrows()]
         if key[0] == 'cluster' and len(rows) > 1:
-            alerts.append(_incident_from_cluster(rows, am_map, partner_names, p4_breakdown_dict, date))
+            alerts.append(_incident_from_cluster(rows, am_map, partner_names, date))
         else:
             for row in rows:
-                alerts.append(_single_alert_from_row(row, am_map, partner_names, p4_breakdown_dict, date))
+                alerts.append(_single_alert_from_row(row, am_map, partner_names, date))
     return alerts
 
 
-def parse_p4_breakdown(breakdown_str: str) -> Optional[dict]:
-    """fetch_p4_country_breakdown() (daily_health_check.py) returns a pre-formatted display
-    string ("VE 22, BO 11, AR 2"), not a dict - parsed back here rather than changing that
-    function's own return shape (it's also used, unchanged, by the old renderer during the
-    transition). See NOT_PROVIDED: this round-trip (dict -> string -> dict) is a smell; the
-    cleaner fix is for fetch_p4_country_breakdown() to return the dict and let ITS caller
-    format the string, once the old renderer is fully retired."""
-    if not breakdown_str:
-        return None
-    pairs = re.findall(r'([A-Z]{2})\s+(\d+)', breakdown_str)
-    return {k: int(v) for k, v in pairs} if pairs else None
+# parse_p4_breakdown() REMOVED 2026-11-18 (user: "each country as a project") - see
+# daily_health_check.py's own removal note on fetch_p4_country_breakdown(), the only caller of
+# this function's output.
 
 
 # ================================================================= deliverable 5
@@ -469,9 +473,10 @@ Fields the current engine/attribution data cannot confidently fill - left unset 
    rate, not a historical self-baseline) is mapped to EXPECTED, the closest of the task's 4
    enum values - not a perfect fit. A literal "PEER" baseline type isn't in the given enum.
 
-4. geo_mix is only ever populated for Project 4 (Brazino777.io) - fetch_p4_country_breakdown()
-   is the only source of country-level data anywhere in this pipeline, confirmed by grep. Every
-   other brand's Alert.geo_mix is None, not an empty-but-real {}.
+4. geo_mix is never populated by this module (removed 2026-11-18, see
+   daily_health_check.py's own removal note on fetch_p4_country_breakdown() - its only source).
+   Alert.geo_mix stays supported generically by alert_types.py/alert_render.py for a future
+   brand that genuinely needs it; every Alert this module builds today has geo_mix=None.
 
 5. Dimension.label for a BREADTH alert's own items (TOP_ITEMS) carries no traffic_type/segment
    info - the engine's hit-GUID note (see #2) names only the guid and its own % change.

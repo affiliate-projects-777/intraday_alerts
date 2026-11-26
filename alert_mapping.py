@@ -372,10 +372,16 @@ def _deviation_data_for(row, unit: Unit) -> DeviationData:
     dev_baseline = float(row['baseline']) if baseline_type != BaselineType.NONE else None
     if rule_id.startswith('RTP-') and dev_baseline is not None:
         dev_baseline = _RTP_NORMAL_TARGET
-    if unit == Unit.MULTIPLE:
+    if unit == Unit.MULTIPLE and rule_id.startswith('ENG-'):
         # health_check_engine.py's ratio_sum_baseline() stores every ratio *100 (the same
         # convention every RATE metric uses) - unscale back to a plain multiple (40.06, not
         # 4005.8) now that this metric displays as "40.1x" rather than a percentage.
+        # FIX (2026-11-26, user: "ROAS: 64% drop (0.0x today vs. last week's figure of 0.0x) does
+        # not make sense"): this used to apply to EVERY Unit.MULTIPLE metric, but only ENG is
+        # stored *100. ROA-01 stores the raw ratio (run_roas(): round(roas_this, 3)), so it was
+        # being divided by 100 a second time - Brazino777.io (VE) 0.111 vs 0.308 rendered as
+        # "0.0x vs 0.0x". The % change was always right (a ratio of two scaled values); only the
+        # displayed numbers were 100x too small.
         value /= 100
         if dev_baseline is not None:
             dev_baseline /= 100
